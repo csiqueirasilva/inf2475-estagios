@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "internship-matching"
+version = "0.1.0"
+description = "Internship dataset sanitization and ML matching toolkit"
+authors = ["Caio Siqueira <csiqueira@puc-rio.br>"]
+license = "MIT"
+readme = "README.md"
+packages = [
+  { include = "internship_matching", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+click = "^8.1"
+torch = "^2.0"
+transformers = "^4.30"
+numpy = "^1.25"
+pandas = "^2.0"
+pysqlite3-binary = "^0.5.4"
+psycopg2-binary = "^2.9.10"
+langchain-ollama = "^0.3.2"
+tqdm = "^4.67.1"
+torchvision = "^0.22.0"
+torchaudio = "^2.7.0"
+scikit-learn = "^1.6.1"
+keybert = "^0.9.0"
+nltk = "^3.9.1"
+sentence-transformers = "^4.1.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4"
+black = "^24.3"
+flake8 = "^6.0"
+
+[tool.poetry.scripts]
+internship = "internship_matching.cli:cli"
+
+[tool.poetry.group.dev.dependencies]
+debugpy = "^1.8.14"
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
