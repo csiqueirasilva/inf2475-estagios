@@ -124,13 +124,15 @@ def train_cv_autoencoder():
 @train.command("cv-autolabeler")
 def train_cv_autolabeler():
     labeler = CVAutoLabeler()
-    labeler.fit_kmeans()
-    labeler.name_clusters_keybert()
-    labeler.save_keybert()
-    labeler.name_clusters_tfidf()
-    labeler.save_tfidf()
-    labeler.name_clusters_ctfidf()
-    labeler.save_ctfidf()
+    # labeler.fit_kmeans()
+    # labeler.name_clusters_keybert()
+    # labeler.save_keybert()
+    # labeler.name_clusters_tfidf()
+    # labeler.save_tfidf()
+    # labeler.name_clusters_ctfidf()
+    # labeler.save_ctfidf()
+    labeler.name_clusters_bertopic()
+    labeler.save_bertopic()
 
 @train.command("cv-job")
 def train_cv_job():

@@ -3,6 +3,8 @@
 import ast
 import json
 import os
+import warnings
+from bertopic import BERTopic
 import joblib
 import nltk
 import psycopg2
@@ -11,9 +13,23 @@ from typing import List, Dict, Union
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
 from keybert import KeyBERT
 from .db import POSTGRES_URL
 from sentence_transformers import SentenceTransformer, models
+
+# Suppress HDBSCAN doc-string escape warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r".*invalid escape sequence.*",
+    category=SyntaxWarning
+)
+
+# (Optional) suppress llvmlite execution engine messages
+warnings.filterwarnings(
+    "ignore",
+    message=r".*ExecutionEngine._raw_object_cache_notify.*"
+)
 
 nltk.download("stopwords", quiet=True)
 
@@ -22,6 +38,9 @@ PT_STOPWORDS = stopwords.words("portuguese")
 
 CVS_KEYBERT_CLUSTERNAMES_FILE_PATH = "data/models/keybert_cv_cluster_names.json"
 CVS_KEYBERT_KMEANS_FILE_PATH = "data/models/keybert_cv_kmeans.joblib"
+
+CVS_BERTOPIC_CLUSTERNAMES_FILE_PATH = "data/models/bertopic_cv_cluster_names.json"
+CVS_BERTOPIC_MODELDIR_FILE_PATH = "data/models/bertopic_cv"
 
 CVS_TFIDF_CLUSTERNAMES_FILE_PATH = "data/models/tfidf_cv_cluster_names.json"
 CVS_TFIDF_KMEANS_FILE_PATH = "data/models/tfidf_cv_kmeans.joblib"
@@ -50,23 +69,23 @@ class CVAutoLabeler:
 
         # opcao 1 para keybert, fazer o nosso
 
-        # # 1) Load the base Transformer
-        # word_emb = models.Transformer("neuralmind/bert-base-portuguese-cased")
+        # 1) Load the base Transformer
+        word_emb = models.Transformer("neuralmind/bert-base-portuguese-cased")
 
-        # # 2) Add a mean-pooling layer
-        # pool = models.Pooling(
-        #     word_emb.get_word_embedding_dimension(),
-        #     pooling_mode_mean_tokens=True
-        # )
+        # 2) Add a mean-pooling layer
+        pool = models.Pooling(
+            word_emb.get_word_embedding_dimension(),
+            pooling_mode_mean_tokens=True
+        )
 
-        # # 3) Assemble the SentenceTransformer
-        # sbert_model = SentenceTransformer(modules=[word_emb, pool])
+        # 3) Assemble the SentenceTransformer
+        sbert_model = SentenceTransformer(modules=[word_emb, pool])
 
-        # self._kw_model = KeyBERT(model=sbert_model)
+        self._kw_model = KeyBERT(model=sbert_model)
 
         # opcao 2 para keybert, user um pronto
-        model = SentenceTransformer("alfaneo/bertimbau-base-portuguese-sts")
-        self._kw_model = KeyBERT(model=model)
+        # model = SentenceTransformer("alfaneo/bertimbau-base-portuguese-sts")
+        # self._kw_model = KeyBERT(model=model)
 
     # ——————————————————————————————————————————————————————————————
     # 1) Fitting & Naming
@@ -156,7 +175,7 @@ class CVAutoLabeler:
         for cid in range(self.n_clusters):
             self._cluster_names.setdefault(cid, f"Cluster {cid}")
 
-    def name_clusters_keybert(self, top_n: int = 3):
+    def name_clusters_keybert(self, top_n: int = 1):
         """Name each cluster via KeyBERT keyphrases."""
         if self._kmeans is None:
             raise RuntimeError("Call fit_kmeans() first")
@@ -172,15 +191,64 @@ class CVAutoLabeler:
             mega = " ".join(docs)[:10_000]
             kws  = self._kw_model.extract_keywords(
                 mega,
-                keyphrase_ngram_range=(1,2),
+                keyphrase_ngram_range=(1,1),
                 stop_words=PT_STOPWORDS,
-                top_n=top_n
+                top_n=top_n,
+                use_maxsum=False,
+                use_mmr=False,
+                diversity=0.7
             )
             names[cid] = " / ".join(k for k,_ in kws).title()
         self._cluster_names = names
 
         for cid in range(self.n_clusters):
             self._cluster_names.setdefault(cid, f"Cluster {cid}")
+
+    def name_clusters_bertopic(self, top_n: int = 1):
+        """
+        Name each cluster via BERTopic, extracting the top 'top_n' terms per topic.
+        """
+        # 1) Fetch all raw CV texts (we ignore latents here)
+        texts, _ = self._fetch_texts_and_latents()
+
+        sentence_model = SentenceTransformer("alfaneo/bertimbau-base-portuguese-sts")
+
+        # 2) Build a CountVectorizer with Portuguese stop-words and bi-grams
+        vectorizer = CountVectorizer(
+            stop_words=PT_STOPWORDS, 
+            ngram_range=(1, 2), 
+            strip_accents=None, 
+            lowercase=True, 
+            token_pattern=r"(?u)\b\w+\b",
+            max_df=0.01,       # ignore terms in >1% of clusters
+            min_df=1,         # keep terms appearing in at least one cluster
+            max_features=2000 # cap vocabulary size
+        )                     # supports passing a custom vectorizer to BERTopic
+
+        # 3) Instantiate BERTopic with our vectorizer
+        topic_model = BERTopic(
+            embedding_model=sentence_model,
+            vectorizer_model=vectorizer,
+            calculate_probabilities=False,
+            verbose=False
+        )                          # fit_transform uses UMAP→HDBSCAN→c-TF-IDF
+
+        # 4) Fit the model and get topic assignments for each CV
+        topics, _ = topic_model.fit_transform(texts)  # topics: List[int], one per document
+
+        # 5) Extract top-n terms per topic into self._cluster_names
+        names = {}
+        for cid in set(topics):
+            terms = topic_model.get_topic(cid)        # returns List[(str, float)]
+            # join the top_n words
+            names[cid] = " / ".join([t for t, _ in terms[:top_n]]).title()
+
+        # 6) Ensure every cluster ID up to self.n_clusters has a name
+        for cid in range(self.n_clusters):
+            names.setdefault(cid, f"Cluster {cid}")
+
+        self._cluster_names = names
+        self._topic_model = topic_model
 
     # ——————————————————————————————————————————————————————————————
     # 2) Persistence
@@ -215,6 +283,13 @@ class CVAutoLabeler:
 
     def save_ctfidf(self):
         return self.save(CVS_CTFIDF_KMEANS_FILE_PATH, CVS_CTFIDF_CLUSTERNAMES_FILE_PATH)
+    
+    def save_bertopic(self):
+        names_dir = os.path.dirname(CVS_BERTOPIC_CLUSTERNAMES_FILE_PATH)
+        os.makedirs(names_dir, exist_ok=True)
+        with open(CVS_BERTOPIC_CLUSTERNAMES_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(self._cluster_names, f, ensure_ascii=False, indent=2)
+        self._topic_model.save(CVS_BERTOPIC_MODELDIR_FILE_PATH)
 
     @classmethod
     def load(
@@ -248,6 +323,13 @@ class CVAutoLabeler:
     @classmethod
     def load_ctfidf(cls):
         return cls.load(CVS_CTFIDF_KMEANS_FILE_PATH, CVS_CTFIDF_CLUSTERNAMES_FILE_PATH)
+    
+    @classmethod
+    def load_bertopic(cls):
+        self = cls()
+        from bertopic import BERTopic
+        self._topic_model = BERTopic.load(CVS_BERTOPIC_MODELDIR_FILE_PATH)
+        return self
 
     # ——————————————————————————————————————————————————————————————
     # 3) Prediction
