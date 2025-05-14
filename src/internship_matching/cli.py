@@ -9,7 +9,7 @@ from .data.autolabeler import CVAutoLabeler
 
 from .data.autoencoder import CVAutoencoder
 
-from .data.cvs      import sanitize_input_cvs, store_embeddings_cv
+from .data.cvs      import sanitize_input_cvs, store_embeddings_cv, store_embeddings_singles_cv
 from .data.jobs     import sanitize_input_jobs
 from .training.train_cv_job    import train_cv_job_matching
 from .training.train_cv_feat   import train_cv_feature_scoring
@@ -54,7 +54,7 @@ def database(ctx):
 def cvs():
     records = sanitize_input_cvs()
     embed_func = get_embed_func()
-    store_embeddings_cv(records, embed_func)
+    store_embeddings_singles_cv(records, embed_func)
     click.echo(f"✅ Generated embeddings for CVs")
 
 @sanitize.command()

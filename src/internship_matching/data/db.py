@@ -280,9 +280,9 @@ def update_students_course_names(conn, batch_size=1000):
     FROM students s
     INNER JOIN raw_student_course_codes maps ON maps.matricula = s.matricula
     INNER JOIN raw_course_code_map mapc
-        ON mapc.sigla_curso = maps.sigla_curso
-       AND mapc.sigla_hab = maps.sigla_hab
-       AND mapc.sigla_enf = maps.sigla_enf
+        ON (mapc.sigla_curso = maps.sigla_curso or (mapc.sigla_curso = 'nan' and maps.sigla_curso = ''))
+       AND (mapc.sigla_hab = maps.sigla_hab or (mapc.sigla_hab = 'nan' and maps.sigla_hab = '')) 
+       AND (mapc.sigla_enf = maps.sigla_enf or (mapc.sigla_enf = 'nan' and maps.sigla_enf = ''))
     WHERE (s.course_name = 'DESCONHECIDO' or s.course_name is null) AND s.fonte_aluno = 'VRADM'
     """
 
