@@ -58,7 +58,14 @@ def sanitize_input_cvs(sqlite_db_path: str = SQLITE_URL) -> List[Dict]:
         experiences = ", ".join(process_multivalue(row["experiences"]))
         languages   = ", ".join(process_multivalue(row["languages"]))
 
-        has_cv_data = True if birthdate == not_available and gender == not_available and interests == not_available and educations == not_available and experiences == not_available and languages == not_available else False
+        has_cv_data = (
+            (birthdate != not_available and birthdate) or 
+            (gender != not_available and gender) or 
+            (interests != not_available and interests) or
+            (educations != not_available and educations) or
+            (experiences != not_available and experiences) or
+            (languages != not_available and languages)
+        )
 
         text = (
             f"Course: {course}. Birthdate: {birthdate}. Gender: {gender}. "
@@ -105,7 +112,7 @@ def store_embeddings_singles_cv(
             pbar.set_postfix(fonte_aluno=rec["fonte_aluno"], matricula=rec["matricula"])
 
             cur.execute(
-                "SELECT 1 FROM cv_embeddings WHERE llm_parsed_raw_input IS NOT NULL AND last_update > now() - interval '12 hour' AND matricula = %s AND fonte_aluno = %s",
+                "SELECT 1 FROM cv_embeddings WHERE llm_parsed_raw_input IS NOT NULL AND last_update < now() - interval '24 hours' AND matricula = %s AND fonte_aluno = %s",
                 (rec["matricula"], rec["fonte_aluno"])
             )
             exists_recent = cur.fetchone() is not None
@@ -200,7 +207,9 @@ def store_embeddings_singles_cv(
     """, (rec["fonte_aluno"], rec["matricula"]))
                     all_text = sqlite_cur.fetchone()["all_internships_text"] or ''
 
-                    if all_text != '': 
+                    if curso == 'DESCONHECIDO':
+                        parsed = "Currículo indisponível"
+                    elif all_text != '': 
 
                         cv_data_sqlite_string = f"Curso: {curso}\nInformações de experiências de estágio: \n{all_text}"
 

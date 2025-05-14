@@ -7,7 +7,7 @@ from langchain_ollama import ChatOllama
 OLLAMA_LLM = OllamaLLM(
     model="gemma3:12b",
     base_url = OLLAMA_URL, 
-    request_timeout=30,
+    request_timeout=5,
     temperature=0,
     repeat_penalty=1.5,
     num_predict=500
