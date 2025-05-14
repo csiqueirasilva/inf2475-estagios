@@ -112,7 +112,14 @@ def store_embeddings_singles_cv(
             pbar.set_postfix(fonte_aluno=rec["fonte_aluno"], matricula=rec["matricula"])
 
             cur.execute(
-                "SELECT 1 FROM cv_embeddings WHERE llm_parsed_raw_input IS NOT NULL AND last_update < now() - interval '24 hours' AND matricula = %s AND fonte_aluno = %s",
+                """
+                SELECT 1 
+                FROM cv_embeddings 
+                WHERE 
+                    llm_parsed_raw_input IS NOT NULL AND
+                    last_update > now() - interval '24 hours' AND
+                    matricula = %s AND fonte_aluno = %s
+                """,
                 (rec["matricula"], rec["fonte_aluno"])
             )
             exists_recent = cur.fetchone() is not None
