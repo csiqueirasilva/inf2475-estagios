@@ -133,14 +133,14 @@ def store_embeddings_singles_cv(
                     # prepare prompt for LLM call
                     prompt = [
                         ("system", 
-                        "O currículo a seguir deve ser preparado para futura clusterização com seu texto totalmente em português brasileiro. Sua saída deve ser apenas o texto do currículo formatado em 500 tokens ou menos. Não responda nenhum comentário sobre como o texto é ou foi otimizado, apenas retorne o currículo pronto para clusterização. Se uma informação não estiver disponível, não a inclua. Não comece a saída usando a chave Currículo:. Caso o currículo não disponha de informaçãoes suficientes, apenas use a saída: Currículo indisponível"),
+                        "As informações de entrada do usuário vieram de um currículo. Você deve preparar um texto para futura clusterização, e o texto de saída deve ser totalmente em português brasileiro. Sua saída deve ser apenas o texto do formatado em 500 tokens ou menos. Não responda nenhum comentário sobre como o texto é ou foi otimizado, apenas retorne o currículo pronto para clusterização. Se uma informação não estiver disponível, não a inclua. Não comece a saída usando a chave Currículo:. Se o curso for desconhecido, use a saída: Currículo indisponível. Caso apenas o curso seja conhecido e não houver nenhuma outra informação disponível, use a saída: Aluno cursando [curso] sem experiências. Caso o curso seja DESCONHECIDO e nenhuma outra informação esteja disponível, retorna: Currículo indisponível."),
                         ("human", text)
                     ]
                     # single invoke
                     try:
                         parsed = OLLAMA_LLM.invoke(prompt)
                         parsed = OLLAMA_LLM.invoke([
-                            ("system", "Reescreva exatamente a entrada, mas traduzindo para português brasileiro."),
+                            ("system", "Reescreva exatamente a entrada, mas traduzindo para português brasileiro. Apenas retorne a tradução."),
                             ("human", parsed)
                         ])
                     except:
