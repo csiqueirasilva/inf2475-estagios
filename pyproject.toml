@@ -10,7 +10,7 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.12"
 click = "^8.1"
 torch = "^2.7.0"
 transformers = "^4.30"
@@ -28,6 +28,9 @@ nltk = "^3.9.1"
 sentence-transformers = "^4.1.0"
 bertopic = "^0.17.0"
 hf-xet = "^1.1.0"
+matplotlib = "^3.10.3"
+umap-learn = "^0.5.7"
+hdbscan = "^0.8.40"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.4"

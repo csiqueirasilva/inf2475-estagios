@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
+from typing import Any, Dict, Union
 import pandas as pd
+import psycopg2
 
 POSTGRES_URL = "postgresql://postgres:postgres@localhost:5432/ai_test"
 SQLITE_URL = "data/processed/data.db"
@@ -497,3 +499,14 @@ def start_database_import(database_path = SQLITE_URL, csv_root_path = "data"):
     db_path = Path(database_path)
     schema_path = Path("sql/schema.sql")
     init_db(str(db_path), str(schema_path), str(csv_root_path))
+
+def fetch_courses_per_student(database_path = SQLITE_URL):
+    conn = sqlite3.connect(database_path)
+    query = """
+    SELECT fonte_aluno, matricula, course_name
+    FROM students
+    WHERE course_name IS NOT NULL
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df

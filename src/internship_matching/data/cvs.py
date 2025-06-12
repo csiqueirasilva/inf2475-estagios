@@ -3,16 +3,108 @@ import sqlite3
 from typing import Any, Dict, List, Union
 
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
-from ..data.embed import OLLAMA_LLM
+from ..constants import CVS_EMBEDDING_COLUMN_NAME, CVS_LATENT_SIZE
 
-from ..data.db import POSTGRES_URL, SQLITE_URL
+from ..data.embed import OLLAMA_LLM, get_embed_func
+
+from ..data.db import POSTGRES_URL, SQLITE_URL, fetch_courses_per_student
 from ..utils import get_device
 import psycopg2
 from typing import Callable, Optional, List, Dict, Union, Any
 
 import time
+
+def cv_fill_raw_embeddings(
+    pg_conn_params: Union[str, dict] = POSTGRES_URL,
+    batch_size: int = 100
+) -> None:
+    """
+    Fetch rows whose raw_embedding IS NULL, compute new embeddings with get_embed_func(),
+    and write them back into cv_embeddings.raw_embedding using (fonte_aluno, matricula) as key.
+    The embed_func takes a list of raw_input strings and returns a list of embedding vectors.
+    Shows progress with tqdm.
+    """
+    embed_func = get_embed_func()
+
+    # Establish connection
+    conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
+           else psycopg2.connect(**pg_conn_params)
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Get total count for progress bar
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM cv_embeddings
+                    WHERE raw_embedding IS NULL
+                """)
+                total_rows = cur.fetchone()[0]
+
+                select_sql = """
+                    SELECT fonte_aluno, matricula, raw_input
+                    FROM cv_embeddings
+                    WHERE raw_embedding IS NULL
+                    ORDER BY fonte_aluno, matricula
+                    LIMIT %s
+                """
+                update_sql = """
+                    UPDATE cv_embeddings
+                    SET raw_embedding = %s
+                    WHERE fonte_aluno = %s
+                      AND matricula    = %s
+                """
+
+                processed = 0
+                pbar = tqdm(total=total_rows, desc="Embedding CVs", unit="row")
+
+                while True:
+                    cur.execute(select_sql, (batch_size,))
+                    rows = cur.fetchall()
+                    if not rows:
+                        break
+
+                    # Prepare batch for embedding
+                    keys = [(fa, mat) for fa, mat, _ in rows]
+                    texts = [raw for _, _, raw in rows]
+
+                    # Compute embeddings for the batch
+                    embeddings = embed_func(texts)  # List[List[float]]
+
+                    # Update each row with its embedding
+                    for (fa, mat), vec in zip(keys, embeddings):
+                        vec_list = [float(x) for x in vec]
+                        cur.execute(update_sql, (json.dumps(vec_list), fa, mat))
+                    
+                    conn.commit()
+
+                    processed_batch = len(rows)
+                    processed += processed_batch
+                    pbar.update(processed_batch)
+
+                pbar.close()
+                print(f"✅ Populated for cv raw_embeddings for {processed} rows.")
+    finally:
+        conn.close()
+
+def update_raw_embeddings(): 
+    """
+    Updates the raw embeddings in the cv_embeddings table.
+    This is a temporary function to be removed in the future.
+    """
+    conn = psycopg2.connect(POSTGRES_URL)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE cv_embeddings
+        SET raw_embedding = embedding
+        WHERE raw_embedding IS NULL
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def sanitize_input_cvs(sqlite_db_path: str = SQLITE_URL) -> List[Dict]:
     """
@@ -240,24 +332,27 @@ def store_embeddings_singles_cv(
 
                 # compute embedding for this single result
                 vec = embed_func([parsed])[0] if embed_func else None
+                vec2 = embed_func([rec.get("text", '')])[0] if embed_func else None
 
                 # upsert into PostgreSQL
                 cur.execute(
                     """
                     INSERT INTO cv_embeddings
-                    (fonte_aluno, matricula, raw_input, llm_parsed_raw_input, embedding, last_update)
-                    VALUES (%s, %s, %s, %s, %s, localtimestamp)
+                    (fonte_aluno, matricula, raw_input, llm_parsed_raw_input, embedding, raw_embedding, last_update)
+                    VALUES (%s, %s, %s, %s, %s, %s, localtimestamp)
                     ON CONFLICT (fonte_aluno, matricula) DO UPDATE
                     SET last_update = localtimestamp,
                         llm_parsed_raw_input = EXCLUDED.llm_parsed_raw_input,
-                        embedding = COALESCE(EXCLUDED.embedding, cv_embeddings.embedding)
+                        embedding = COALESCE(EXCLUDED.embedding, cv_embeddings.embedding),
+                        raw_embedding = COALESCE(EXCLUDED.raw_embedding, cv_embeddings.raw_embedding)
                     """,
                     (
                         rec["fonte_aluno"],
                         rec["matricula"],
                         rec.get("text", ''),
                         parsed,
-                        vec
+                        vec,
+                        vec2
                     )
                 )
                 conn.commit()
@@ -333,8 +428,171 @@ def store_embeddings_cv(
     cur.close()
     conn.close()
 
+def reset_database_embeddings_size_cv(
+    pg_conn_params: Union[str, dict] = POSTGRES_URL,
+    latent_size: int = CVS_LATENT_SIZE
+) -> None:
+    """
+    Wipes out the old latent_code column, then alters its type to vector(latent_size).
+    """
+    # Connect
+    conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
+           else psycopg2.connect(**pg_conn_params)
+    # We need DDL, so either autocommit or explicit commit after each
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            # 1) Null-out the old values
+            cur.execute("UPDATE cv_embeddings SET latent_code = NULL;")
+            # 2) Alter the column type; since everything is NULL, the USING cast is trivial
+            cur.execute(
+                f"""
+                ALTER TABLE cv_embeddings
+                ALTER COLUMN latent_code
+                TYPE vector({latent_size})
+                USING latent_code::vector({latent_size});
+                """
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def fetch_experiences_per_student(
+    embedding_column: str = CVS_EMBEDDING_COLUMN_NAME,
+    pg_conn_params: Union[str, Dict[str, Any]] = POSTGRES_URL,
+) -> pd.DataFrame:
+    """
+    Fetch fonte_aluno, matricula and whether the student has experience (tem_experiencia)
+    from Postgres, based on the llm_parsed_raw_input flag.
+
+    Returns a DataFrame with columns:
+      ['fonte_aluno', 'matricula', 'tem_experiencia']
+    where tem_experiencia is a boolean.
+    """
+    # 1) open Postgres connection
+    conn = (
+        psycopg2.connect(pg_conn_params)
+        if isinstance(pg_conn_params, str)
+        else psycopg2.connect(**pg_conn_params)
+    )
+
+    # 2) define and run the query
+    query = f"""
+        SELECT
+          fonte_aluno,
+          matricula,
+          NOT (llm_parsed_raw_input LIKE '%Aluno cursando%sem experi_ncias%' or llm_parsed_raw_input like '%Currículo indisponível%')
+            AS tem_experiencia,
+        {embedding_column}
+        FROM cv_embeddings;
+    """
+    df = pd.read_sql_query(query, conn)
+    
+    df[embedding_column] = df[embedding_column].apply(json.loads)
+
+    # 3) close connection and return
+    conn.close()
+    return df
+
+def fetch_embeddings_cv_with_courses_filtered_with_experience(
+    embedding_column: str = CVS_EMBEDDING_COLUMN_NAME,
+    pg_conn_params: Union[str, dict] = POSTGRES_URL,
+) -> pd.DataFrame:
+    """
+    Fetch cv_embeddings.fonte_aluno, matricula, <embedding_column> from Postgres,
+    parse the JSON arrays into Python lists, then inner-join to courses_df
+    (which must have fonte_aluno, matricula, course_name).
+
+    Returns a DataFrame with columns:
+      ['fonte_aluno', 'matricula', 'course_name', embedding_column]
+    where embedding_column holds a Python list (or np.array, if you .apply(np.array)).
+    """
+
+    courses_df = fetch_courses_per_student()
+
+    # 1) pull raw embedding strings from Postgres
+    conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
+           else psycopg2.connect(**pg_conn_params)
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT fonte_aluno, matricula, {embedding_column}, latent_code, llm_parsed_raw_input as text
+        FROM cv_embeddings
+        WHERE llm_parsed_raw_input not LIKE '%Aluno cursando%sem experi_ncias%' and llm_parsed_raw_input not like '%Currículo indisponível%'
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # 2) build a DataFrame
+    emb_df = pd.DataFrame(rows, columns=["fonte_aluno", "matricula", embedding_column, "latent_code", "text"])
+
+    # 3) parse JSON text → list of floats
+    emb_df[embedding_column] = emb_df[embedding_column].apply(json.loads)
+    emb_df["latent_code"] = emb_df["latent_code"].apply(json.loads)
+
+    # 4) join to your courses_df
+    merged = pd.merge(
+        courses_df,
+        emb_df,
+        on=["fonte_aluno", "matricula"],
+        how="inner",    # only keep students with both an embedding and a course
+        validate="one_to_one"
+    )
+
+    return merged
+
+def fetch_embeddings_cv_with_courses(
+    embedding_column: str = CVS_EMBEDDING_COLUMN_NAME,
+    pg_conn_params: Union[str, dict] = POSTGRES_URL,
+) -> pd.DataFrame:
+    """
+    Fetch cv_embeddings.fonte_aluno, matricula, <embedding_column> from Postgres,
+    parse the JSON arrays into Python lists, then inner-join to courses_df
+    (which must have fonte_aluno, matricula, course_name).
+
+    Returns a DataFrame with columns:
+      ['fonte_aluno', 'matricula', 'course_name', embedding_column]
+    where embedding_column holds a Python list (or np.array, if you .apply(np.array)).
+    """
+
+    courses_df = fetch_courses_per_student()
+
+    # 1) pull raw embedding strings from Postgres
+    conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
+           else psycopg2.connect(**pg_conn_params)
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT fonte_aluno, matricula, {embedding_column}, latent_code, llm_parsed_raw_input as text
+        FROM cv_embeddings
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # 2) build a DataFrame
+    emb_df = pd.DataFrame(rows, columns=["fonte_aluno", "matricula", embedding_column, "latent_code", "text"])
+
+    # 3) parse JSON text → list of floats
+    emb_df[embedding_column] = emb_df[embedding_column].apply(json.loads)
+    emb_df["latent_code"] = emb_df["latent_code"].apply(json.loads)
+
+    # 4) join to your courses_df
+    merged = pd.merge(
+        courses_df,
+        emb_df,
+        on=["fonte_aluno", "matricula"],
+        how="inner",    # only keep students with both an embedding and a course
+        validate="one_to_one"
+    )
+
+    return merged
+
 def fetch_embeddings_cv(
-    pg_conn_params: Union[str, dict] = POSTGRES_URL
+    pg_conn_params: Union[str, dict] = POSTGRES_URL,
+    embedding_column: str = CVS_EMBEDDING_COLUMN_NAME
 ) -> np.ndarray:
     """
     Fetches all embeddings from cv_embeddings, parsing the string
@@ -344,7 +602,7 @@ def fetch_embeddings_cv(
     conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
            else psycopg2.connect(**pg_conn_params)
     cur = conn.cursor()
-    cur.execute("SELECT embedding FROM cv_embeddings")
+    cur.execute(f"SELECT {embedding_column} FROM cv_embeddings")
     rows = cur.fetchall()
     cur.close()
     conn.close()
