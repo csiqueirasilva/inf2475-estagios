@@ -46,6 +46,59 @@ from .models.inference       import infer_cv_job, infer_cv_feat, infer_job_feat
 from .data.db import POSTGRES_URL, init_db, start_database_import
 from .data.embed import get_embed_func
 
+# ─── HELPERS ─────────────────────────────────────────────────────────────
+import json, numpy as np, psycopg2, matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.cluster.hierarchy import linkage, leaves_list
+
+def _pgvec(v):
+    "Robust pgvector → np.array for both binary & string payloads"
+    if isinstance(v, str):  # string like "[0.1,0.2,…]"
+        return np.array(json.loads(v), dtype=np.float32)
+    return np.array(v, dtype=np.float32)
+
+def _fetch_cluster_vectors(source: str, cid: int):
+    """
+    Returns (ids, matrix) for the given cluster_id.
+
+    ids  : list[str]  labels for rows/cols
+    matrix : np.ndarray of shape (N, D)
+    """
+    src = {
+        "cv":        ("cv_nomic_clusters",  "cv_embeddings",
+                      ["fonte_aluno", "matricula"], "embedding"),
+        "cv-ae":     ("cv_clusters",        "cv_embeddings",
+                      ["fonte_aluno", "matricula"], "latent_code"),
+        "job":       ("job_nomic_clusters", "job_embeddings",
+                      ["fonte_aluno", "matricula", "contract_id"], "embedding"),
+        "job-ae":    ("job_clusters",       "job_embeddings",
+                      ["fonte_aluno", "matricula", "contract_id"], "latent_code"),
+    }[source]
+
+    clust_tbl, emb_tbl, key_cols, vcol = src
+    on_cond  = " AND ".join([f"c.{c}=e.{c}" for c in key_cols])
+
+    sql = f"""
+      SELECT {", ".join(["e."+c for c in key_cols])}, e.{vcol}
+      FROM   {clust_tbl}  c
+      JOIN   {emb_tbl}    e
+      ON     {on_cond}
+      WHERE  c.cluster_id = %s
+    """
+
+    conn = psycopg2.connect(POSTGRES_URL if isinstance(POSTGRES_URL, str) else POSTGRES_URL)
+    cur  = conn.cursor()
+    cur.execute(sql, (cid,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    if not rows:
+        raise click.ClickException(f"Cluster {cid} not found in {clust_tbl}")
+
+    labels = [",".join(map(str, r[:-1])) for r in rows]
+    vecs   = np.stack([_pgvec(r[-1]) for r in rows])
+    return labels, vecs
+
 _DEFAULT_DATABASE_FILE = "data/processed/data.db"
 
 # ─── ROOT CLI ────────────────────────────────────────────────────────────────
@@ -217,6 +270,143 @@ def _persist_clusters(
         pickle.dump(clusterer, fp)
     click.echo(f"Saved {description} HDBSCAN clusterer to {cluster_file_path}")
 
+# ─── CLUSTER QA / SUMMARY ─────────────────────────────────────────────
+@cluster.command("stats")
+@click.option(
+    "--source",
+    type=click.Choice(
+        ["job", "cv", "job-nomic", "cv-nomic"],
+        case_sensitive=False
+    ),
+    required=True,
+    help="Which cluster table to analyse."
+)
+@click.option("--min-size", default=1, show_default=True,
+              help="Discard clusters smaller than this.  Use 1 to keep all.")
+@click.option("--top", default=None,
+              help="Show only the TOP largest clusters in the console. "
+                   "CSV export always contains everything that passed the filter.")
+@click.option("--sample", default=300,
+              help="Max items per cluster when computing similarity (-1 = no cap).")
+@click.option("--pbar/--no-pbar", default=False,
+              help="Show tqdm progress bar while crunching clusters.")
+@click.option("--stats-only", is_flag=True,
+              help="Skip per‑cluster table and print only corpus‑level aggregates.")
+@click.option("--export-csv", type=click.Path(), default=None,
+              help="Optional path to write the full stats CSV.")
+def cluster_stats(source, min_size, top, sample, pbar, stats_only, export_csv):
+    """
+    Quality metrics for ALL clusters (median, min, p25, p75 similarity).
+
+    Examples
+    --------
+    # Full corpus → CSV, no console spam
+    internship cluster stats --source job-nomic --export-csv data/cluster_stats.csv --stats-only
+
+    # Show biggest 50 clusters and progress bar
+    internship cluster stats --source cv-nomic --top 50 --pbar
+    """
+    import pandas as pd, numpy as np, psycopg2, textwrap, sys
+    from sklearn.metrics.pairwise import cosine_similarity
+    from tqdm import tqdm
+
+    src_map = {
+        "job":       ("job_clusters",       "job_embeddings",       "latent_code", "raw_input"),
+        "job-nomic": ("job_nomic_clusters", "job_embeddings",       "embedding",   "raw_input"),
+        "cv":        ("cv_clusters",        "cv_embeddings",        "latent_code", "llm_parsed_raw_input"),
+        "cv-nomic":  ("cv_nomic_clusters",  "cv_embeddings",        "embedding",   "llm_parsed_raw_input"),
+    }
+    clust_tbl, emb_tbl, vec_col, text_col = src_map[source.lower()]
+
+    # --- build JOIN query --------------------------------------------------
+    on_cols = ["fonte_aluno", "matricula"] + (["contract_id"] if "job" in source else [])
+    on_cond = " AND ".join([f"c.{c}=e.{c}" for c in on_cols])
+    sql = f"""
+        SELECT c.cluster_id,
+               e.{vec_col}  AS vec,
+               e.{text_col} AS txt
+        FROM   {clust_tbl} c
+        JOIN   {emb_tbl}   e
+        ON     {on_cond}
+        WHERE  c.cluster_id != -1
+    """
+
+    conn = psycopg2.connect(POSTGRES_URL) if isinstance(POSTGRES_URL, str) \
+           else psycopg2.connect(**POSTGRES_URL)
+    df = pd.read_sql(sql, conn)
+    conn.close()
+
+    df["vec"] = df["vec"].apply(lambda v: np.array(json.loads(v), dtype=np.float32))
+
+    # --- crunch per‑cluster ------------------------------------------------
+    clusters = df.groupby("cluster_id")
+    iterator = tqdm(clusters, desc="Clusters") if pbar else clusters
+
+    rows = []
+    for cid, grp in iterator:
+        sz = len(grp)
+        if sz < min_size:
+            continue
+
+        # sampling
+        take = grp if sample == -1 or sz <= sample else grp.sample(sample, random_state=42)
+        vecs = np.stack(take["vec"])
+        if vecs.shape[0] == 1:
+            # only one unique vector (or only one item after sampling)
+            upper = np.array([1.0])
+        else:
+            sims  = cosine_similarity(vecs)
+            upper = sims[np.triu_indices_from(sims, k=1)]
+
+        rows.append({
+            "cluster_id": cid,
+            "size": sz,
+            "median_sim": np.median(upper),
+            "min_sim":    upper.min(),
+            "p25":        np.percentile(upper, 25),
+            "p75":        np.percentile(upper, 75),
+            "snippet": textwrap.shorten(
+                take["txt"].mode()[0] if not take["txt"].empty else "",
+                width=60, placeholder="…")
+        })
+
+    if not rows:
+        click.echo("⚠️  No clusters survived the filters.")
+        sys.exit()
+
+    out = pd.DataFrame(rows).sort_values("size", ascending=False)
+
+    # --- export / print ----------------------------------------------------
+    if export_csv:
+        out.to_csv(export_csv, index=False)
+        click.echo(f"📄 Stats written to {export_csv}")
+
+    # global aggregates
+    agg = out.agg({
+        "size":       ["count", "min", "median", "mean", "max"],
+        "median_sim": ["min", "median", "mean", "max"],
+        "p25":        ["min", "median", "mean", "max"],
+        "p75":        ["min", "median", "mean", "max"]
+    })
+    click.echo("\n── Corpus‑level summary ─────────────────────────────")
+    click.echo(agg.to_string(float_format=lambda x: f"{x:,.3f}"))
+    click.echo("────────────────────────────────────────────────────\n")
+
+    if stats_only:
+        return
+
+    if top:
+        show = out.head(int(top))
+    else:
+        show = out
+    # nicer formatting
+    show = show.assign(
+        median_sim=lambda d: d["median_sim"].round(5),
+        min_sim=lambda d: d["min_sim"].round(5),
+        p25=lambda d: d["p25"].round(5),
+        p75=lambda d: d["p75"].round(5)
+    )
+    click.echo(show.to_string(index=False))
 
 # ─── Updated CLI commands ─────────────────────────────────────────────
 @cluster.command("persist-cv-clusters")
@@ -294,8 +484,8 @@ def persist_nomic_cv_clusters():
 
     # parameters
     cv_params = {
-        "min_cluster_size": 20,
-        "min_samples": 10,
+        "min_cluster_size": 5,
+        "min_samples": 3,
         "metric": "euclidean",
         "algorithm": "generic",
         "cluster_selection_method": "eom",
@@ -497,6 +687,406 @@ def cv_cluster_gen_labels():
 def plot():
     """Model plot commands."""
     pass
+
+# ─── (2a) UNIQUENESS SCORE PER ITEM ──────────────────────────────────────
+@plot.command("cluster-uniqueness")
+@click.option("--source", type=click.Choice(["cv", "cv-ae", "job", "job-ae"],
+                                            case_sensitive=False),
+              required=True, help="Which cluster table / embedding to use")
+@click.option("--cluster-id", type=int, required=True)
+@click.option("--k", default=10, show_default=True,
+              help="k-NN count in uniqueness score")
+@click.option("--output", default=None,
+              help="PNG/PDF path; default into data/processed/")
+def cluster_uniqueness(source, cluster_id, k, output):
+    """
+    Bar-plot of uniqueness score inside one cluster.
+
+    Uniqueness = 1 − mean(cosine_sim to k nearest neighbours).
+    """
+    import pandas as pd
+    from pathlib import Path
+    from datetime import datetime
+
+    labels, X = _fetch_cluster_vectors(source.lower(), cluster_id)
+    N, _ = X.shape
+    k = min(k, N-1)
+
+    sims = cosine_similarity(X)
+    # for each row, take k largest sims (excluding self on diag)
+    uniq = []
+    for i in range(N):
+        s = np.partition(sims[i], -k-1)[-k-1:-1]  # fastest k (skip self)
+        uniq.append(1.0 - s.mean())
+    uniq = np.array(uniq)
+
+    order = uniq.argsort()[::-1]           # most unique on top
+    labels_ord, uniq_ord = np.array(labels)[order], uniq[order]
+
+    plt.figure(figsize=(8, max(4, 0.25*N)))
+    plt.barh(range(N), uniq_ord, color="tab:blue")
+    plt.yticks(range(N), labels_ord, fontsize=7)
+    plt.gca().invert_yaxis()
+    plt.xlabel(f"Uniqueness (k={k})  ↑ more unique")
+    plt.title(f"Cluster {cluster_id} – {source.upper()} ({N} items)")
+    plt.tight_layout()
+
+    if output is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output = Path("data/processed") / f"uniq_{source}_{cluster_id}_{ts}.png"
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, dpi=150)
+    plt.close()
+    click.echo(f"✅ Uniqueness plot saved to {output}")
+
+# ─── (2b) INTRA-CLUSTER HEAT-MAP ─────────────────────────────────────────
+@plot.command("cluster-heatmap")
+@click.option("--source", type=click.Choice(["cv", "cv-ae", "job", "job-ae"],
+                                            case_sensitive=False),
+              required=True)
+@click.option("--cluster-id", type=int, required=True)
+@click.option("--sample", default=60, show_default=True,
+              help="If cluster is larger, random-sample this many items "
+                   "(-1 = take all)")
+@click.option("--interpolate", default="nearest", show_default=True,
+              help='Value for matplotlib.imshow "interpolation" argument; '
+                   'e.g. "nearest", "none", "bilinear"')                   
+@click.option("--output", default=None)
+def cluster_heatmap(source, cluster_id, sample, interpolate, output):
+    """
+    K×K cosine-similarity heat-map of one cluster (hierarchically ordered).
+    """
+    from pathlib import Path
+    from datetime import datetime
+
+    labels, X = _fetch_cluster_vectors(source.lower(), cluster_id)
+    N = X.shape[0]
+    if sample != -1 and N > sample:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(N, sample, replace=False)
+        X, labels = X[idx], [labels[i] for i in idx]
+        N = sample
+
+    sims = cosine_similarity(X)
+
+    # hierarchical ordering
+    Z      = linkage(sims, method="average")
+    leaves = leaves_list(Z)
+    sims   = sims[leaves][:, leaves]
+    labels = [labels[i] for i in leaves]
+
+    plt.figure(figsize=(0.25*N + 2, 0.25*N + 2))
+    im = plt.imshow(sims, cmap="viridis", vmin=0.0, vmax=1.0, interpolation=interpolate)
+    plt.xticks(range(N), labels, rotation=90, fontsize=6)
+    plt.yticks(range(N), labels, fontsize=6)
+    plt.colorbar(im, fraction=0.046, pad=0.04).set_label("Cosine similarity")
+    plt.title(f"Cluster {cluster_id} – {source.upper()}  (N={N})")
+    plt.tight_layout()
+
+    if output is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output = Path("data/processed") / f"heat_{source}_{cluster_id}_{ts}.png"
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, dpi=150)
+    plt.close()
+    click.echo(f"✅ Heat-map saved to {output}")
+
+@plot.command("compare-heatmap")
+@click.option(
+    "--mode",
+    type=click.Choice(
+        ["cv-to-cv", "cv-to-job", "job-to-job", "job-to-cv"],
+        case_sensitive=False
+    ),
+    required=True,
+    help="""
+    cv-to-cv   : highlight 1 CV against its nearest CV neighbours
+    cv-to-job  : compare 1 CV against job-cluster centroids
+    job-to-job : highlight 1 job against its nearest job neighbours
+    job-to-cv  : compare 1 job against CV-cluster centroids
+    """
+)
+@click.option("--id", "item_key", required=True,
+              help="(fonte_aluno,matricula) for CV or contract_id for Job")
+@click.option("--topk", default=30, show_default=True,
+              help="How many neighbours / clusters to show.")
+@click.option("--output", default=None,
+              help="Path to save PNG (defaults to data/processed/)")
+def compare_heatmap(mode, item_key, topk, output):
+    """
+    Visualise similarity of a single item to peers or centroids.
+
+    Examples
+    --------
+    # one CV vs 30 nearest CVs
+    internship plot compare-heatmap --mode cv-to-cv --id VRADM,0116256
+
+    # that same CV against all job cluster centroids (top 30)
+    internship plot compare-heatmap --mode cv-to-job --id VRADM,0116256
+
+    # one job vs jobs in its own cluster
+    internship plot compare-heatmap --mode job-to-job --id 181012
+    """
+    import matplotlib.pyplot as plt, numpy as np, json, psycopg2, os
+    from sklearn.metrics.pairwise import cosine_similarity
+    from datetime import datetime
+    from pathlib import Path
+
+    def pg_vec(v):
+        return np.array(json.loads(v), dtype=np.float32) if isinstance(v, str) else np.array(v, dtype=np.float32)
+
+    # ── extract query vector ────────────────────────────────────────────
+    conn = psycopg2.connect(POSTGRES_URL if isinstance(POSTGRES_URL, str) else POSTGRES_URL)
+    cur  = conn.cursor()
+
+    if mode.startswith("cv"):
+        fonte, matric = map(str.strip, item_key.split(","))
+        cur.execute("SELECT embedding FROM cv_embeddings WHERE fonte_aluno=%s AND matricula=%s",
+                    (fonte, matric))
+    else:
+        contract_id = int(item_key)
+        cur.execute("SELECT embedding FROM job_embeddings WHERE contract_id=%s",
+                    (contract_id,))
+    row = cur.fetchone()
+    if not row:
+        click.echo("❌ Item not found.")
+        return
+    qvec = pg_vec(row[0]).reshape(1, -1)
+
+    # ── prepare comparison matrix ───────────────────────────────────────
+    if mode == "cv-to-cv":
+        # pull nearest CV neighbours by cosine similarity
+        cur.execute("""
+            SELECT fonte_aluno, matricula, embedding
+            FROM   cv_embeddings
+            """)  # naive; for >50k CVs use ANN instead
+        peers = cur.fetchall()
+        mats  = np.stack([pg_vec(r[2]) for r in peers])
+        sims  = cosine_similarity(qvec, mats).flatten()
+        top   = sims.argsort()[::-1][1:topk+1]  # skip self
+        labels = [f"{peers[i][0]},{peers[i][1]}" for i in top]
+        sims   = sims[top]
+
+    elif mode == "job-to-job":
+        cur.execute("SELECT contract_id, embedding FROM job_embeddings")
+        peers = cur.fetchall()
+        mats  = np.stack([pg_vec(r[1]) for r in peers])
+        sims  = cosine_similarity(qvec, mats).flatten()
+        top   = sims.argsort()[::-1][1:topk+1]
+        labels = [str(peers[i][0]) for i in top]
+        sims   = sims[top]
+
+    elif mode == "cv-to-job":
+        cur.execute("SELECT cluster_id, centroid FROM job_nomic_centroids")
+        rows = cur.fetchall()
+        mats = np.stack([pg_vec(r[1]) for r in rows])
+        sims = cosine_similarity(qvec, mats).flatten()
+        top  = sims.argsort()[::-1][:topk]
+        labels = [f"jobC{rows[i][0]}" for i in top]
+        sims   = sims[top]
+
+    else:  # job-to-cv
+        cur.execute("SELECT cluster_id, centroid FROM cv_nomic_centroids")
+        rows = cur.fetchall()
+        mats = np.stack([pg_vec(r[1]) for r in rows])
+        sims = cosine_similarity(qvec, mats).flatten()
+        top  = sims.argsort()[::-1][:topk]
+        labels = [f"cvC{rows[i][0]}" for i in top]
+        sims   = sims[top]
+
+    cur.close(); conn.close()
+
+    # ── plot ────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 0.4*len(sims)))
+    im = ax.imshow(sims.reshape(1, -1), cmap="viridis", aspect="auto")
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=90, fontsize=8)
+    ax.set_yticks([]); ax.set_xlabel("Similarity →")
+
+    cbar = plt.colorbar(im, ax=ax, orientation="vertical", shrink=0.5)
+    cbar.set_label("Cosine similarity")
+
+    title = f"{mode.upper()} – top {len(sims)}"
+    ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+
+    if output is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"compare_heatmap_{mode}_{ts}.png"
+        output = Path("data/processed") / fname
+    else:
+        output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, dpi=150)
+    plt.close()
+    click.echo(f"✅ Heat-map saved to {output}")
+
+# ─── CLUSTER‑DENSITY HISTOGRAM ──────────────────────────────────────────────
+@plot.command("cluster-density-hist")
+@click.option(
+    "--source",
+    type=click.Choice(
+        ["job", "cv", "job-nomic", "cv-nomic"],
+        case_sensitive=False
+    ),
+    required=True,
+    help="Which cluster‑assignment table to plot:\n"
+         "  job        -> job_clusters\n"
+         "  cv         -> cv_clusters\n"
+         "  job-nomic  -> job_nomic_clusters\n"
+         "  cv-nomic   -> cv_nomic_clusters",
+)
+@click.option(
+    "--exclude-noise/--include-noise",
+    default=True,
+    show_default=True,
+    help="Exclude HDBSCAN noise points (cluster_id = -1) from the histogram."
+)
+@click.option(
+    "--bins",
+    default="auto",
+    help="Matplotlib bin specification (e.g. 50, 'auto', 'sturges', …)."
+)
+@click.option(
+    "--output",
+    "output_path",
+    default=None,
+    help="Optional path to save the figure.  "
+         "If omitted, a timestamped PNG goes to data/processed/."
+)
+@click.option("--logx/--linearx", default=False, help="Log-scale X axis")
+@click.option("--logy/--lineary", default=False, help="Log-scale Y axis")
+@click.option(
+    "--clip-top",
+    type=int,
+    default=0,
+    help="Remove the N largest clusters before plotting"
+)
+@click.option(
+    "--cdf", "plot_cdf",
+    is_flag=True,
+    help="Plot cumulative distribution instead of histogram"
+)
+@click.option(
+    "--annotate-top",
+    type=int,
+    default=0,
+    help="Annotate the K largest clusters on the plot"
+)
+def plot_cluster_density_hist(source, exclude_noise, bins, output_path, logx, logy, clip_top, plot_cdf, annotate_top):
+    """
+    Histogram of cluster sizes (#items per cluster).
+
+    Examples
+    --------
+    internship plot cluster-density-hist --source job-nomic
+    internship plot cluster-density-hist --source cv --bins 40
+    internship plot cluster-density-hist --source cv-nomic --include-noise
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import psycopg2
+    from datetime import datetime
+    from pathlib import Path
+
+    # ── 1) Map human flag → table name & nice title ───────────────────────
+    src_map = {
+        "job":       ("job_clusters",       "Job (latent‑AE)"),
+        "cv":        ("cv_clusters",        "CV (latent‑AE)"),
+        "job-nomic": ("job_nomic_clusters", "Job (Nomic)"),
+        "cv-nomic":  ("cv_nomic_clusters",  "CV (Nomic)"),
+    }
+    table, pretty = src_map[source.lower()]
+
+    # ── 2) Query Postgres for cluster sizes ───────────────────────────────
+    conn = psycopg2.connect(POSTGRES_URL) if isinstance(POSTGRES_URL, str) \
+           else psycopg2.connect(**POSTGRES_URL)
+
+    q = f"""
+        SELECT cluster_id, COUNT(*) AS size
+        FROM {table}
+        GROUP BY cluster_id
+    """
+    df = pd.read_sql(q, conn)
+    conn.close()
+
+    if exclude_noise:
+        df = df[df.cluster_id != -1]
+
+    if df.empty:
+        click.echo("⚠️  No clusters to plot after filtering; aborting.")
+        return
+
+    sizes = df["size"].to_numpy()
+
+    # ── preprocessing: clip top outliers if requested ──────────────
+    df = df.sort_values("size", ascending=False)
+    if clip_top > 0:
+        df = df.iloc[clip_top:]
+
+    sizes = df["size"].to_numpy()
+    if sizes.size == 0:
+        click.echo("⚠️ Nothing left to plot after clipping; aborting.")
+        return
+
+    # ── plotting ──────────────────────────────────────────────────
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    plt.figure(figsize=(7, 4))
+    if plot_cdf:
+        sorted_sizes = np.sort(sizes)
+        cdf = np.arange(1, len(sorted_sizes)+1) / len(sorted_sizes)
+        plt.step(sorted_sizes, cdf)
+        plt.ylabel("Cumulative fraction of clusters")
+    else:
+        # parse fancy bin spec start:stop:step
+        if isinstance(bins, str) and ":" in bins:
+            start, stop, step = map(int, bins.split(":"))
+            bins = np.arange(start, stop + step, step)
+        plt.hist(sizes, bins=bins, edgecolor="black")
+        plt.ylabel("Number of clusters")
+
+    plt.xlabel("Cluster size (# items)")
+    plt.title(f"Cluster‑Size Distribution – {pretty}")
+
+    # log scales
+    if logx:
+        plt.xscale("log")
+    if logy:
+        plt.yscale("log")
+
+    # annotate top clusters
+    if annotate_top > 0 and not plot_cdf:
+        top = df.head(annotate_top)
+        for _, row in top.iterrows():
+            plt.annotate(f"{int(row.size)}",
+                         xy=(row.size, 0),
+                         xytext=(0, 6),
+                         textcoords="offset points",
+                         ha="center",
+                         fontsize=8,
+                         rotation=90)
+
+    plt.tight_layout()
+
+    # ── 4) Determine output path & save ───────────────────────────────────
+    if output_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"cluster_density_{source}_{ts}.png"
+        output_path = Path("data/processed") / fname
+    else:
+        output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+    # ── 5) Console summary ────────────────────────────────────────────────
+    click.echo(f"✅ Histogram saved to {output_path}")
+    click.echo(f"   Clusters plotted : {len(sizes):,}")
+    click.echo(f"   Min / Median / Max size : "
+               f"{sizes.min():,} / {np.median(sizes):,.0f} / {sizes.max():,}")
 
 @plot.command("cv-autoencoder")
 @deprecated("Esse comando é antigo. O relatório até funciona, mas foram desenvolvidos relatórios melhores.")
