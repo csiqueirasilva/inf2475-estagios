@@ -186,3 +186,53 @@ def store_clusters_and_centroids(
     conn.commit()
     cur.close()
     conn.close()
+
+import json, numpy as np, psycopg2, matplotlib.pyplot as plt
+
+def _pgvec(v):
+    "Robust pgvector → np.array for both binary & string payloads"
+    if isinstance(v, str):  # string like "[0.1,0.2,…]"
+        return np.array(json.loads(v), dtype=np.float32)
+    return np.array(v, dtype=np.float32)
+
+def fetch_cluster_vectors(source: str, cid: int):
+    """
+    Returns (ids, matrix) for the given cluster_id.
+
+    ids  : list[str]  labels for rows/cols
+    matrix : np.ndarray of shape (N, D)
+    """
+    src = {
+        "cv":        ("cv_nomic_clusters",  "cv_embeddings",
+                      ["fonte_aluno", "matricula"], "embedding"),
+        "cv-ae":     ("cv_clusters",        "cv_embeddings",
+                      ["fonte_aluno", "matricula"], "latent_code"),
+        "job":       ("job_nomic_clusters", "job_embeddings",
+                      ["fonte_aluno", "matricula", "contract_id"], "embedding"),
+        "job-ae":    ("job_clusters",       "job_embeddings",
+                      ["fonte_aluno", "matricula", "contract_id"], "latent_code"),
+    }[source]
+
+    clust_tbl, emb_tbl, key_cols, vcol = src
+    on_cond  = " AND ".join([f"c.{c}=e.{c}" for c in key_cols])
+
+    sql = f"""
+      SELECT {", ".join(["e."+c for c in key_cols])}, e.{vcol}
+      FROM   {clust_tbl}  c
+      JOIN   {emb_tbl}    e
+      ON     {on_cond}
+      WHERE  c.cluster_id = %s
+    """
+
+    conn = psycopg2.connect(POSTGRES_URL if isinstance(POSTGRES_URL, str) else POSTGRES_URL)
+    cur  = conn.cursor()
+    cur.execute(sql, (cid,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    if not rows:
+        raise click.ClickException(f"Cluster {cid} not found in {clust_tbl}")
+
+    labels = [",".join(map(str, r[:-1])) for r in rows]
+    vecs   = np.stack([_pgvec(r[-1]) for r in rows])
+    return labels, vecs

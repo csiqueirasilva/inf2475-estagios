@@ -1,11 +1,15 @@
 import random
 import math
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from typing import Optional, List
+from typing import Counter, Optional, List
+from sklearn.feature_extraction.text import CountVectorizer
+
+from internship_matching.data.autolabeler import PT_STOPWORDS
 
 def plot_embeddings_latent_space(
     df: pd.DataFrame,
@@ -105,3 +109,94 @@ def plot_embeddings_latent_space(
         plt.show()
     plt.close()
     print(f"Plot saved to {output_path}")
+
+word_re = re.compile(r"\b\w+\b", flags=re.UNICODE)
+
+def generate_cluster_names_manual(
+    df,
+    cluster_col="hdbscan",
+    text_col="text",
+    top_n=10
+):
+    # helper to reject any token with digits
+    def is_non_numeric(token):
+        return not re.search(r"\d", token)
+
+    # 1) Document frequencies (DF)
+    total_docs = len(df)
+    df_counts = Counter()
+    for doc in df[text_col].astype(str):
+        tokens = {
+            w.lower()
+            for w in word_re.findall(doc)
+            if w.lower() not in PT_STOPWORDS
+            and is_non_numeric(w)
+        }
+        df_counts.update(tokens)
+
+    # 2) Per‐cluster TF & TF–IDF scoring
+    cluster_names = {}
+    for cid in sorted(df[cluster_col].unique()):
+        if cid == -1:
+            cluster_names[cid] = "Noise"
+            continue
+
+        texts = df.loc[df[cluster_col] == cid, text_col].astype(str)
+        if texts.empty:
+            cluster_names[cid] = "Unknown"
+            continue
+
+        # term freqs (TF) in this cluster
+        tf_counts = Counter()
+        for doc in texts:
+            tokens = [
+                w.lower()
+                for w in word_re.findall(doc)
+                if w.lower() not in PT_STOPWORDS
+                and is_non_numeric(w)
+            ]
+            tf_counts.update(tokens)
+
+        # compute TF–IDF–style score
+        scores = {}
+        for term, count in tf_counts.items():
+            # DF lookup from global df_counts
+            df_count = df_counts.get(term, 0)
+            idf = math.log((total_docs) / (1 + df_count))
+            scores[term] = (count / len(texts)) * idf
+
+        # pick top_n and join
+        top_terms = sorted(scores, key=scores.get, reverse=True)[:top_n]
+        cluster_names[cid] = " / ".join(top_terms) if top_terms else "—"
+
+    return cluster_names
+
+def generate_cluster_names(
+    df: pd.DataFrame,
+    cluster_col: str = "hdbscan_umap",
+    name_col:    str = "course_name",
+    top_n:       int = 3
+) -> dict[int, str]:
+    """
+    For each cluster ID (excluding noise = -1), find the top_n most
+    common words/phrases in the course_name texts, and join them as a label.
+    """
+    vectorizer = CountVectorizer(
+        stop_words=PT_STOPWORDS,
+        ngram_range=(1,2),    # allow unigrams & bigrams
+        max_features=top_n
+    )
+    labels = {}
+    for cluster in sorted(df[cluster_col].unique()):
+        if cluster == -1:
+            labels[cluster] = "Noise"
+            continue
+        texts = df.loc[df[cluster_col] == cluster, name_col].astype(str)
+        if texts.empty:
+            labels[cluster] = "Unknown"
+            continue
+        X = vectorizer.fit_transform(texts)
+        # get the top words by frequency
+        features = vectorizer.get_feature_names_out()
+        labels[cluster] = " / ".join(features)
+    return labels

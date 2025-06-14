@@ -9,7 +9,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import hdbscan
 import click
 
-from internship_matching.data.db import POSTGRES_URL
+from ..data.db import POSTGRES_URL
 
 def match_jobs_pipeline(
     query_vec: np.ndarray,
