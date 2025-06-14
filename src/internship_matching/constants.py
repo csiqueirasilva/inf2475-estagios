@@ -40,3 +40,5 @@ CLUSTERER_PATHS: Dict[str, Path] = {
     "cv-nomic":       CV_NOMIC_CLUSTER_FILE_PATH,
     "cv-autoencode":  CV_CLUSTER_FILE_PATH,
 }
+
+DEFAULT_TOP_K_LABELS = 50
