@@ -11,13 +11,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
+
+from ..data.sharedautoencoder import CVJobSharedAutoencoder
 from .root import cli
 from ..data.match import match_jobs_pipeline
 from ..utils import deprecated
 from ..data.job_autoencoder import JobAutoencoder
-from ..constants import CV_CLUSTER_FILE_PATH, CV_NOMIC_CLUSTER_FILE_PATH, CVS_AUTOENCODER_FILE_PATH, JOB_CLUSTER_FILE_PATH, JOB_NOMIC_CLUSTER_FILE_PATH, JOBS_AUTOENCODER_FILE_PATH
+from ..constants import COLUMN_SHARED_LATENT_CODE, CV_CLUSTER_FILE_PATH, CV_NOMIC_CLUSTER_FILE_PATH, CVS_AUTOENCODER_FILE_PATH, DEFAULT_PIPELINE_TOP_K_LABELS, JOB_CLUSTER_FILE_PATH, JOB_NOMIC_CLUSTER_FILE_PATH, JOBS_AUTOENCODER_FILE_PATH, JOBS_EMBEDDING_COLUMN_NAME
 from ..data.autoencoder import CVAutoencoder
-from ..data.cvs      import fetch_embeddings_cv_with_courses_filtered_with_experience
+from ..data.cvs      import fetch_embeddings_cv_with_courses_filtered_with_experience, fetch_single_embedding_cv
 from ..data.jobs     import fetch_embeddings_job_with_metadata
 from ..models.inference       import infer_cv_feat, infer_job_feat
 from ..data.db import POSTGRES_URL
@@ -168,11 +170,13 @@ def run_cv_autoencoder(text: str):
               help="Direct CV text input (bypass matricula lookup)")
 @click.option("--matricula", 'matricula', type=str,
               help="Student matricula to fetch stored CV (if no text provided)")
+@click.option("--top-k", default=DEFAULT_PIPELINE_TOP_K_LABELS, type=int,
+              help="Top k results to return in primary cluster")
 @click.option("--fonte", default="VRADM", show_default=True,
               help="Fonte_aluno key for lookup if matricula is used")
 @click.option("--skip-fit", is_flag=True,
               help="Skip HDBSCAN prediction; assign by nearest centroid only")
-def run_cv_nomic_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: bool):
+def run_cv_nomic_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: bool, top_k: int):
     """
     Match a CV against existing job clusters, using either direct input
     (--cv-file or --cv-text) or a stored matricula lookup, **without** any
@@ -219,7 +223,8 @@ def run_cv_nomic_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: boo
         job_assignments_table="job_nomic_clusters",
         jobs_fetcher=fetch_embeddings_job_with_metadata,
         embedding_col="embedding",
-        skip_fit=skip_fit
+        skip_fit=skip_fit,
+        primary_top_k=top_k,
     )
     click.echo(json.dumps(out, indent=2))
 
@@ -230,89 +235,135 @@ def run_cv_nomic_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: boo
               help="Direct CV text input (bypass matricula lookup)")
 @click.option("--matricula", 'matricula', type=str,
               help="Student matricula to fetch stored CV (if no text provided)")
+@click.option("--top-k", default=DEFAULT_PIPELINE_TOP_K_LABELS, type=int,
+              help="Top k results to return in primary cluster")
 @click.option("--fonte", default="VRADM", show_default=True,
               help="Fonte_aluno key for lookup if matricula is used")
 @click.option("--skip-fit", is_flag=True,
               help="Skip HDBSCAN prediction; assign by nearest centroid only")
-def run_cv_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: bool):
+def run_cv_job(matricula, fonte, cv_file, cv_text, skip_fit, top_k):
     """
-    Match a CV against existing job clusters, using either direct input
-    (--cv-file or --cv-text) or a stored matricula lookup.
+    Match a CV against existing job clusters using the *shared* CV–Job
+    autoencoder latent space (96-d).
     """
-    uid = str(uuid.uuid4())
-    click.echo("Matching CV to job clusters...")
+    click.echo("🔍 Matching CV (shared-AE 96-d) to job clusters…")
 
-    # ── 1) Prepare raw CV embedding ─────────────────────────────────────
-    embed_func = get_embed_func()
+    # ── 1) Prepare raw CV embedding ─────────────────────────────────────────
     if cv_file:
-        raw_cv = cv_file.read()
+        raw = cv_file.read()
+        emb = get_embed_func()(raw)
     elif cv_text:
-        raw_cv = cv_text
+        emb = get_embed_func()(cv_text)
     elif matricula:
-        from ..data.cvs import fetch_single_embedding_cv
-        vec = fetch_single_embedding_cv(fonte, matricula)
-        if vec is None:
+        emb = fetch_single_embedding_cv(fonte, matricula)
+        if emb is None:
             click.echo(f"❌ No embedding found for ({fonte}, {matricula})", err=True)
             raise click.Abort()
-        raw_embedding = np.array(vec, dtype=np.float32)
     else:
         click.echo("❌ Please provide --cv-file, --cv-text, or --matricula", err=True)
         raise click.Abort()
 
-    if 'raw_cv' in locals():
-        raw_embedding = np.array(embed_func(raw_cv), dtype=np.float32)
+    raw_embedding = np.array(emb, dtype=np.float32)
+    click.echo("  → Raw 768-d embedding ready")
 
-    # ── 2) Encode to latent space ───────────────────────────────────────
-    ae = CVAutoencoder.load(CVS_AUTOENCODER_FILE_PATH)
+    # ── 2) Encode to **shared** latent space with CVJobSharedAutoencoder ────
+    ae = CVJobSharedAutoencoder.load()  # assumes default path inside class
     ae.eval()
-    x = torch.tensor(raw_embedding, dtype=torch.float32).unsqueeze(0)\
-             .to(ae.encoder[0].weight.device)
     with torch.no_grad():
-        _, z = ae(x)
-    student_latent = z.cpu().numpy().squeeze(0).astype(np.float64)
-    student_norm   = normalize(student_latent.reshape(1, -1), norm="l2")[0]
+        # .encode expects a 2-D array, returns (N,96)
+        latent = ae.encode(raw_embedding.reshape(1, -1)).squeeze(0)
+    query_latent = normalize(latent.reshape(1, -1), norm="l2")[0]
+    click.echo("  → Encoded to shared-AE 96-d and normalized")
 
-    # ── 3) CV clustering ────────────────────────────────────────────────
-    click.echo("  → Predicting CV cluster from text input…")
-    with open(CV_CLUSTER_FILE_PATH, 'rb') as f:
-        cv_clust = pickle.load(f)
-    cv_lbls, _ = hdbscan.approximate_predict(cv_clust, student_norm.reshape(1, -1))
-    student_cv_cluster = int(cv_lbls[0])
-    click.echo(f"  → CV cluster = {student_cv_cluster}")
-
-    # ── 4) Fetch CV centroid ───────────────────────────────────────────
-    conn = psycopg2.connect(POSTGRES_URL) if isinstance(POSTGRES_URL, str) \
-           else psycopg2.connect(**POSTGRES_URL)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT centroid FROM cv_cluster_centroids WHERE cluster_id=%s",
-        (student_cv_cluster,)
-    )
-    row = cur.fetchone()
-    cur.close(); conn.close()
-
-    if row and student_cv_cluster != -1:
-        cv_cent = np.array(
-            json.loads(row[0]) if isinstance(row[0], str) else row[0],
-            dtype=np.float64
-        )
-        query_vec = normalize(cv_cent.reshape(1, -1), norm="l2")[0]
-        click.echo("  → Using CV centroid for query vector")
-    else:
-        query_vec = student_norm
-        click.echo("  → No CV centroid; using individual CV vector")
-
+    # ── 3) Run match_jobs_pipeline in “auto” mode ────────────────────────────
     out = match_jobs_pipeline(
-        query_vec,
+        query_latent,
         cv_cluster_file=CV_CLUSTER_FILE_PATH,
-        cv_centroids_table="cv_cluster_centroids",
         job_cluster_file=JOB_CLUSTER_FILE_PATH,
+        cv_centroids_table="cv_cluster_centroids",
         job_centroids_table="job_cluster_centroids",
         job_assignments_table="job_clusters",
         jobs_fetcher=fetch_embeddings_job_with_metadata,
-        embedding_col="latent_code",
-        skip_fit=skip_fit
+        embedding_col=COLUMN_SHARED_LATENT_CODE,   # now using shared-AE codes
+        primary_top_k=top_k,
+        skip_fit=skip_fit,
     )
+
+    click.echo(json.dumps(out, indent=2))
+
+@run.command("cv-raw-job")
+@click.option('--cv-file', 'cv_file', type=click.File('r'),
+              help="Path to a plaintext CV file (bypass matricula lookup)")
+@click.option('--cv-text', 'cv_text', type=str,
+              help="Direct CV text input (bypass matricula lookup)")
+@click.option("--matricula", 'matricula', type=str,
+              help="Student matricula to fetch stored CV (if no text provided)")
+@click.option("--fonte", default="VRADM", show_default=True,
+              help="Fonte_aluno key for lookup if matricula is used")
+@click.option("--top-k", default=DEFAULT_PIPELINE_TOP_K_LABELS, show_default=True,
+              help="How many top matches to return")
+def run_cv_raw_job(cv_file, cv_text, matricula, fonte, top_k):
+    """
+    Match a CV against all jobs by raw 768-d cosine similarity
+    (no clusters, no autoencoder), but output in the same JSON format
+    as cv-job/cv-nomic-job.
+    """
+    click.echo("Matching CV → Jobs by raw 768-d cosine…")
+
+    # 1) build query embedding
+    if cv_file:
+        txt = cv_file.read()
+        emb = get_embed_func()(txt)
+    elif cv_text:
+        emb = get_embed_func()(cv_text)
+    elif matricula:
+        emb = fetch_single_embedding_cv(fonte, matricula)
+        if emb is None:
+            click.echo(f"❌ No embedding found for ({fonte}, {matricula})", err=True)
+            raise click.Abort()
+    else:
+        click.echo("❌ Please provide --cv-file, --cv-text or --matricula", err=True)
+        raise click.Abort()
+
+    qv = normalize(
+        np.array(emb, dtype=np.float32).reshape(1, -1),
+        norm="l2"
+    )[0]
+    click.echo("  → Query vector ready and normalized")
+
+    # 2) load jobs + their raw_input
+    jobs_df = fetch_embeddings_job_with_metadata()
+    job_ids = jobs_df["contract_id"].tolist()
+    raws    = jobs_df["raw_input"].tolist()
+    mat     = np.vstack(jobs_df[JOBS_EMBEDDING_COLUMN_NAME].values).astype(np.float32)
+    mat_n   = normalize(mat, norm="l2")
+    click.echo(f"  → Loaded {len(job_ids)} job embeddings")
+
+    # 3) compute and rank
+    sims = (mat_n @ qv).tolist()
+    ranked = sorted(
+        zip(job_ids, sims, raws),
+        key=lambda x: x[1],
+        reverse=True
+    )[:top_k]
+    click.echo(f"  → Picked top {top_k} matches")
+
+    # 4) build JSON result
+    out = {
+        "student_cv_cluster":    None,
+        "student_job_cluster":   None,
+        "used_simple_assignment": False,
+        "matched_jobs": [
+            {
+                "cluster_id":  None,
+                "contract_id": int(cid),
+                "similarity":  float(score),
+                "raw_input":   raw_input,
+            }
+            for cid, score, raw_input in ranked
+        ]
+    }
+
     click.echo(json.dumps(out, indent=2))
 
 @deprecated("Não foi desenvolvido para o trabalho da disciplina")
