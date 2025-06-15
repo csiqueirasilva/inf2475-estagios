@@ -647,3 +647,39 @@ def fetch_single_embedding_cv(
         # fallback if it's Python literal syntax
         import ast
         return ast.literal_eval(vec_str)
+    
+def fetch_single_shared_latent_cv(fonte_aluno: str, matricula: str) -> list[float] | None:
+    """
+    Grab the pre-computed shared_latent_code (vector(96)) for one CV.
+    """
+    import psycopg2, json
+    conn = psycopg2.connect(POSTGRES_URL)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT shared_latent_code FROM cv_embeddings "
+        "WHERE fonte_aluno = %s AND matricula = %s",
+        (fonte_aluno, matricula)
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or row[0] is None:
+        return None
+    # Depending on your driver, this may already be a Python list;
+    # if it's a JSON/text, do json.loads
+    return row[0] if isinstance(row[0], list) else json.loads(row[0])
+
+def fetch_single_shared_latent_job(contract_id: int) -> list[float] | None:
+    import psycopg2, json
+    conn = psycopg2.connect(POSTGRES_URL)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT shared_latent_code FROM job_embeddings WHERE contract_id = %s",
+        (contract_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or row[0] is None:
+        return None
+    return row[0] if isinstance(row[0], list) else json.loads(row[0])

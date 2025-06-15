@@ -280,7 +280,7 @@ def fetch_embeddings_job_with_metadata(
     conn_pg = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) else psycopg2.connect(**pg_conn_params)
     cur_pg = conn_pg.cursor()
     cur_pg.execute(f"""
-    SELECT fonte_aluno, matricula, contract_id, {embedding_column}, latent_code, raw_input
+    SELECT fonte_aluno, matricula, contract_id, {embedding_column}, latent_code, raw_input, shared_latent_code
       FROM job_embeddings
     """)
     rows_pg = cur_pg.fetchall()
@@ -288,7 +288,7 @@ def fetch_embeddings_job_with_metadata(
     conn_pg.close()
     emb_df = pd.DataFrame(rows_pg, columns=[
         'fonte_aluno', 'matricula', 'contract_id',
-        embedding_column, 'latent_code', 'raw_input'
+        embedding_column, 'latent_code', 'raw_input', 'shared_latent_code'
     ])
 
     # parse JSON/literal embeddings
@@ -302,6 +302,7 @@ def fetch_embeddings_job_with_metadata(
 
     emb_df[embedding_column] = emb_df[embedding_column].apply(parse_vec)
     emb_df['latent_code']     = emb_df['latent_code'].apply(parse_vec)
+    emb_df['shared_latent_code']     = emb_df['shared_latent_code'].apply(parse_vec)
 
     # 3) Merge metadata and embeddings
     df = pd.merge(

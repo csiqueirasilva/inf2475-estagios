@@ -1,6 +1,9 @@
 from pathlib import Path
 from typing import Dict
 
+SHARED_AE_FILE_PATH = "data/processed/shared_autoencoder.pt"
+SHARED_HIDDEN_SIZE = 128
+SHARED_LATENT_SIZE = 96
 
 CVS_AUTOENCODER_FILE_PATH = "data/processed/cv_autoencoder.pt"
 
@@ -33,6 +36,7 @@ JOB_NOMIC_CLUSTER_FILE_PATH = "data/processed/job_nomic_hdbscan_clusters.pkl"
 DEFAULT_DATABASE_FILE = "data/processed/data.db"
 
 COLUMN_LATENT_CODE = "latent_code"
+COLUMN_SHARED_LATENT_CODE = "shared_latent_code"
 
 CLUSTERER_PATHS: Dict[str, Path] = {
     "job-nomic":      JOB_NOMIC_CLUSTER_FILE_PATH,

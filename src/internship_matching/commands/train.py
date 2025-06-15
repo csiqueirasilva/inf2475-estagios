@@ -1,4 +1,5 @@
 
+from ..data.sharedautoencoder import CVJobSharedAutoencoder
 from .root import cli
 from ..utils import deprecated
 from ..data.job_autoencoder import JobAutoencoder
@@ -14,8 +15,13 @@ def train():
     """Model training commands."""
     pass
 
+@train.command("shared-autoencoder")
+def train_shared_autoencoder():
+    CVJobSharedAutoencoder.train_shared()
+    CVJobSharedAutoencoder.generate_all_latents()
+
 @train.command("job-autoencoder")
-def train_cv_autoencoder():
+def train_job_autoencoder():
     JobAutoencoder.train_from_db()
     JobAutoencoder.generate_all_latents()
 

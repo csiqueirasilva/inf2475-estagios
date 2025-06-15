@@ -214,6 +214,7 @@ def run_cv_nomic_job(matricula: str, fonte: str, cv_file, cv_text, skip_fit: boo
         query_vec,
         cv_cluster_file=CV_NOMIC_CLUSTER_FILE_PATH,
         job_cluster_file=JOB_NOMIC_CLUSTER_FILE_PATH,
+        cv_centroids_table="cv_nomic_centroids",
         job_centroids_table="job_nomic_centroids",
         job_assignments_table="job_nomic_clusters",
         jobs_fetcher=fetch_embeddings_job_with_metadata,
