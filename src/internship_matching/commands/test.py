@@ -291,3 +291,4 @@ def cv_simulate(contract_id, embedding_type, cv_text, cv_file, top_k):
     overlap = sorted(set(cv_tokens) & set(job_tokens))
     click.secho(f"Overlap ({len(overlap)}):", fg="yellow")
     click.echo(" / ".join(overlap) if overlap else "—")
+

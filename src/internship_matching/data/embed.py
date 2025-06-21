@@ -1,10 +1,11 @@
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 import numpy as np
+import pandas as pd
 import torch
 
-from internship_matching.data.jobs import TORCH_DEVICE
+from ..data.jobs import TORCH_DEVICE
 
 from ..data.autolabeler import PT_STOPWORDS
 from ..data.plot import word_re
@@ -145,6 +146,21 @@ class NomicTokenExplainer:
             if w.lower() not in PT_STOPWORDS and not any(ch.isdigit() for ch in w)
         ]
 
+    def _cache_paths(self):
+        return (CACHE_DIR / "token_mat.npy",
+                CACHE_DIR / "token_arr.txt")
+
+    def _load_cached(self) -> bool:
+        mat_f, txt_f = self._cache_paths()
+        if mat_f.exists() and txt_f.exists():
+            arr = np.loadtxt(txt_f, dtype=str)
+            vec = np.load(mat_f)
+            # ensure shapes line up?
+            self._vocab = arr.tolist()
+            self._vec_vocab = vec
+            return True
+        return False
+
     def _maybe_embed_tokens(self, vocab: list[str]) -> np.ndarray:
         """
         Embed `vocab` (unique tokens) via Ollama, batching requests.
@@ -185,13 +201,10 @@ class NomicTokenExplainer:
         Extract tokens from `texts`, embed them (if not cached) and keep them in memory.
         Call once per CLI invocation before using `nearest_tokens()`.
         """
-        vocab = sorted(
-            {tok for txt in texts for tok in self._tokens_in(txt)},
-            key=str.lower,
-        )
+        vocab = sorted({tok for txt in texts for tok in self._tokens_in(txt)},
+                       key=str.lower)
         if not vocab:
-            raise ValueError("No tokens extracted from the provided texts.")
-
+            raise ValueError("No tokens extracted.")
         self._vocab = vocab
         self._vec_vocab = self._maybe_embed_tokens(vocab)
 
@@ -200,14 +213,17 @@ class NomicTokenExplainer:
         Return the `k` tokens in the current vocab whose embedding is
         closest in cosine similarity to `vec768`.
         """
+        # lazy‐load from disk if needed
         if self._vocab is None or self._vec_vocab is None:
-            raise RuntimeError("You must call build_vocab_from_texts() first.")
-
-        if vec768.ndim != 1:
-            vec768 = np.asarray(vec768).reshape(-1)
-        vec_norm = vec768 / np.linalg.norm(vec768)
-
-        sims = self._vec_vocab @ vec_norm
+            if not self._load_cached():
+                raise RuntimeError(
+                    "No in-memory vocab and cache not found. "
+                    "Run build_vocab_from_texts() first."
+                )
+        # rest is unchanged
+        v = vec768.reshape(-1)
+        vn = v / np.linalg.norm(v)
+        sims = self._vec_vocab @ vn
         top_idx = sims.argsort()[-k:][::-1]
         return [self._vocab[i] for i in top_idx]
     

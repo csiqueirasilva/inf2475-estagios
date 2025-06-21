@@ -341,3 +341,47 @@ def fetch_job_cluster_centroids(
             vec = json.loads(vec)
         centroids[int(cid)] = np.array(vec, dtype=np.float32)
     return centroids
+
+def fetch_embedding_pairs(
+    limit: int = 500,
+    pg_conn_params: Union[str, Dict[str, Any]] = POSTGRES_URL,
+) -> pd.DataFrame:
+    """
+    Pulls up to `limit` job–CV rows from the database, along with their text
+    and embedding vectors (which may be stored as JSON strings or native arrays).
+    """
+    sql = """
+    SELECT
+      je.fonte_aluno,
+      je.matricula,
+      je.contract_id,
+      je.raw_input    AS job_text,
+      ce.llm_parsed_raw_input AS cv_text,
+      je.embedding    AS job_embedding,
+      ce.embedding    AS cv_embedding
+    FROM job_embeddings je
+    INNER JOIN cv_embeddings ce
+      ON ce.fonte_aluno = je.fonte_aluno
+     AND ce.matricula    = je.matricula
+    WHERE ce.llm_parsed_raw_input NOT LIKE '%%sem experiências%%'
+      AND ce.llm_parsed_raw_input NOT LIKE '%%Currículo indisponível%%'
+    LIMIT %s
+    """
+
+    conn = psycopg2.connect(pg_conn_params) if isinstance(pg_conn_params, str) \
+           else psycopg2.connect(**pg_conn_params)
+    df = pd.read_sql(sql, conn, params=(limit,))
+    conn.close()
+
+    # normalize embeddings from string↔list to List[float]
+    def _parse(vec):
+        if isinstance(vec, str):
+            try:
+                return json.loads(vec)
+            except json.JSONDecodeError:
+                return ast.literal_eval(vec)
+        return list(vec)
+
+    df["job_embedding"] = df["job_embedding"].map(_parse)
+    df["cv_embedding"]  = df["cv_embedding"].map(_parse)
+    return df

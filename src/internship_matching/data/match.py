@@ -1,12 +1,13 @@
 from pathlib import Path
 import textwrap
-from typing import Sequence
+from typing import Any, Dict, List, Sequence
 import uuid
 import json
 import pickle
 import psycopg2
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 import hdbscan
 from functools import lru_cache
 from sklearn.preprocessing import normalize
@@ -266,8 +267,8 @@ def get_distance_suggestions_pipeline(
 
     # 5) Token-based gap analysis
     Expl  = NomicTokenExplainer if embedding_type.upper()=="NOMIC" else LatentTokenExplainer
-    cv_ex  = Expl();  cv_ex.build_vocab_from_texts([cv_text])
-    job_ex = Expl(); job_ex.build_vocab_from_texts([job_text])
+    cv_ex  = Expl()
+    job_ex = Expl()
     cv_tokens  = cv_ex.nearest_tokens(cv_vec,  k=top_k)
     job_tokens = job_ex.nearest_tokens(job_vec, k=top_k)
     missing_tokens = [t for t in job_tokens if t not in cv_tokens]
@@ -311,3 +312,41 @@ def get_distance_suggestions_pipeline(
         "cv_top_tokens":                cv_tokens,
         "job_top_tokens":               job_tokens,
     }
+
+def run_distance_batch(
+    df: pd.DataFrame,
+    embedding_type: str = "NOMIC",
+    top_k: int = 10,
+) -> pd.DataFrame:
+    """
+    For each row in `df`, call your pipeline and collect its key outputs.
+    Shows progress via tqdm. Returns a DataFrame with one row per job–CV pair.
+    """
+    records: List[Dict[str, Any]] = []
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing cases"):
+        res = get_distance_suggestions_pipeline(
+            contract_id=int(row["contract_id"]),
+            cv_text=row["cv_text"],
+            cv_file=None,
+            embedding_type=embedding_type,
+            top_k=top_k,
+        )
+
+        records.append({
+            "fonte_aluno":                row["fonte_aluno"],
+            "matricula":                  row["matricula"],
+            "contract_id":                row["contract_id"],
+            "initial_similarity":         res["initial_similarity"],
+            "initial_norm_similarity":    res["initial_norm_similarity"],
+            "initial_scaled_similarity":  res["initial_scaled_similarity"],
+            "initial_gauge_pct":          res["initial_gauge_pct"],
+            "cv_top_tokens":              ";".join(res["cv_top_tokens"]),
+            "job_top_tokens":             ";".join(res["job_top_tokens"]),
+            "improved_similarity":        res["improved_similarity"],
+            "improved_norm_similarity":   res["improved_norm_similarity"],
+            "improved_scaled_similarity": res["improved_scaled_similarity"],
+            "improved_gauge_pct":         res["improved_gauge_pct"],
+        })
+
+    return pd.DataFrame.from_records(records)

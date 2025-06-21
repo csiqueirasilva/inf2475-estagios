@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging
 from pathlib import Path
 import pickle
@@ -7,6 +8,7 @@ import sqlite3
 import click
 import hdbscan
 import numpy as np
+import pandas as pd
 import psycopg2
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
@@ -15,13 +17,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from ..data.sharedautoencoder import CVJobSharedAutoencoder
 from .root import cli
-from ..data.match import get_distance_suggestions_pipeline, match_jobs_pipeline
+from ..data.match import get_distance_suggestions_pipeline, match_jobs_pipeline, run_distance_batch
 from ..utils import deprecated
 from ..data.job_autoencoder import JobAutoencoder
 from ..constants import COLUMN_SHARED_LATENT_CODE, CV_CLUSTER_FILE_PATH, CV_NOMIC_CLUSTER_FILE_PATH, CVS_AUTOENCODER_FILE_PATH, DEFAULT_PIPELINE_TOP_K_LABELS, JOB_CLUSTER_FILE_PATH, JOB_NOMIC_CLUSTER_FILE_PATH, JOBS_AUTOENCODER_FILE_PATH, JOBS_EMBEDDING_COLUMN_NAME
 from ..data.autoencoder import CVAutoencoder
 from ..data.cvs      import fetch_embeddings_cv_with_courses_filtered_with_experience, fetch_single_embedding_cv
-from ..data.jobs     import fetch_embeddings_job_with_metadata
+from ..data.jobs     import fetch_embedding_pairs, fetch_embeddings_job_with_metadata
 from ..models.inference       import infer_cv_feat, infer_job_feat
 from ..data.db import POSTGRES_URL
 from ..data.embed import get_embed_func
@@ -427,3 +429,113 @@ def distance_suggestions_cmd(contract_id, cv_text, cv_file, embedding_type, top_
     click.echo(f"Improved norm similarity   : {result['improved_norm_similarity']:.4f}")
     click.echo(f"Improved scaled similarity : {result['improved_scaled_similarity']:.4f}")
     click.echo(f"Improved gauge             : {result['improved_gauge_pct']}% ({result['improved_gauge_color']})")
+
+@run.command("distance-suggestions-batch")
+@click.option("--limit", "-n", default=500, show_default=True, type=int,
+              help="Number of job–CV pairs to fetch and process.")
+@click.option("--embedding-type",
+              type=click.Choice(["NOMIC", "AUTOENCODE"], case_sensitive=False),
+              default="NOMIC", show_default=True,
+              help="Embedding space to use.")
+@click.option("--top-k", default=10, show_default=True, type=int,
+              help="Number of tokens for gap analysis.")
+@click.option(
+    "--output-csv", "-o",
+    default="data/processed/distance_suggestions_batch_DTTIME.csv",
+    show_default=True, type=click.Path(),
+    help="Path to write the batch results CSV (use DTTIME in name to auto-stamp)."
+)
+def distance_suggestions_batch_cmd(limit, embedding_type, top_k, output_csv):
+    """
+    Fetch up to LIMIT job–CV cases, run the pipeline on each, write CSV (with IDs),
+    print summary stats (±5-pt gauge margin, best/worst beyond margin), list cases
+    that worsened, and emit a LaTeX summary table.
+    """
+    click.echo(f"Fetching up to {limit} job–CV pairs…")
+    df_pairs = fetch_embedding_pairs(limit=limit)
+
+    click.echo(f"Running pipeline over {len(df_pairs)} pairs…")
+    df_results = run_distance_batch(
+        df_pairs,
+        embedding_type=embedding_type.upper(),
+        top_k=top_k
+    )
+
+    # generate timestamped filename
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = Path(output_csv.replace("DTTIME", ts))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # reorder columns: move gauge pct next to contract_id
+    front = [
+        "fonte_aluno", "matricula", "contract_id",
+        "initial_gauge_pct", "improved_gauge_pct"
+    ]
+    rest = [c for c in df_results.columns if c not in front]
+    df_to_save = df_results[front + rest]
+
+    # Save CSV
+    df_to_save.to_csv(out_path, index=False)
+    click.echo(f"Wrote batch results to {out_path.resolve()}\n")
+
+    # compute gauge diffs and updated summary stats
+    gauge_diffs   = df_results["improved_gauge_pct"] - df_results["initial_gauge_pct"]
+    total         = len(gauge_diffs)
+    improved      = int((gauge_diffs > 5).sum())       # only those > +5 pts
+    worse         = int((gauge_diffs < -5).sum())      # only those < -5 pts
+    within_margin = int((gauge_diffs.abs() <= 5).sum())
+
+    best_idx   = gauge_diffs.idxmax()
+    worst_idx  = gauge_diffs.idxmin()
+    best_diff  = gauge_diffs.loc[best_idx]
+    worst_diff = gauge_diffs.loc[worst_idx]
+
+    # Pretty-print summary
+    click.echo("=== Batch Summary ===")
+    click.echo(f"Total cases                  : {total}")
+    click.echo(f"Improved beyond +5 pts       : {improved}")
+    click.echo(f"Worse beyond -5 pts          : {worse}")
+    click.echo(f"Within ±5-point margin       : {within_margin}")
+    click.echo(f"Best improvement (pts)       : +{best_diff:.1f}")
+    click.echo(f"Worst deterioration (pts)    : {worst_diff:.1f}\n")
+
+    # List worsened cases for inspection (contract_id, initial and improved gauge)
+    worsened = df_results[gauge_diffs < -5]
+    if not worsened.empty:
+        click.echo("Cases worsened beyond -5 pts:")
+        for _, row in worsened.iterrows():
+            click.echo(
+                f" - contract {row['contract_id']}: "
+                f"initial {row['initial_gauge_pct']}% → "
+                f"improved {row['improved_gauge_pct']}%"
+            )
+        click.echo()
+
+    # Build & emit LaTeX summary table
+    summary_df = pd.DataFrame({
+        "Metric": [
+            "Total cases",
+            "Improved beyond +5 pts",
+            "Worse beyond -5 pts",
+            "Within ±5-pt margin",
+            "Best improvement (pts)",
+            "Worst deterioration (pts)"
+        ],
+        "Value": [
+            total,
+            improved,
+            worse,
+            within_margin,
+            f"{best_diff:.1f}",
+            f"{worst_diff:.1f}"
+        ]
+    })
+
+    click.echo("LaTeX summary table (paste into your paper):\n")
+    latex_summary = summary_df.to_latex(
+        index=False,
+        column_format="lr",
+        caption="Summary of Batch Distance-Suggestion Results",
+        label="tab:distance_suggestions_batch_summary"
+    )
+    click.echo(latex_summary)
