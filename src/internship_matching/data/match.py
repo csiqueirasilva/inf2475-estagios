@@ -212,12 +212,6 @@ def compute_gauge(score: float) -> tuple[int, str]:
     return pct, color
 
 def apply_piecewise_power(score: float) -> float:
-    """
-    Apply a discontinuous power-law:
-      - score <= 0.6: exponent 4
-      - 0.6 < score <= 0.9: exponent 2
-      - score > 0.9: exponent 1
-    """
     if score <= 0.65:
         exp = 5.0
     elif score <= 0.88:
