@@ -41,6 +41,42 @@ NOMIC_MODEL_NAME = "nomic-embed-text"
 
 _MAX_WORDS = 250  # hard budget for the answer
 
+def apply_cv_improvements(
+    cv_text: str,
+    suggestions: str
+) -> str:
+    """
+    Use the LLM to integrate suggestions into the CV by producing an updated CV text.
+    Outputs plain text, preserving original format, without Markdown, special formatting, or placeholders.
+    """
+    # System prompt: integrate without markdown, no placeholders
+    sys_msg = (
+        "Você é um assistente que integra recomendações em currículos. "
+        "Gere o texto atualizado do currículo em texto simples, sem Markdown ou negrito, "
+        "e sem usar placeholders como [Nome], [Data], etc."
+    )
+    hum_msg = textwrap.dedent(f"""
+        CURRÍCULO ORIGINAL:
+        {cv_text.strip()}
+
+        SUGESTÕES:
+        {suggestions.strip()}
+
+        Instruções:
+        1. Incorpore as sugestões diretamente no texto.
+        2. Mantenha a formatação original.
+        3. Não utilize listas, marcadores, ou numeração automática.
+        4. Não adicione placeholders entre colchetes (ex.: [Nome da Instituição], [Data]).
+        5. Sua resposta deve conter até {_MAX_WORDS} palavras.
+        6. Responda apenas com o texto do currículo atualizado em português brasileiro.
+    """)
+    response = OLLAMA_LLM_LARGER.invoke([
+        ("system", sys_msg),
+        ("human", hum_msg)
+    ])
+    return str(response)
+
+
 def suggest_cv_improvements(
     cv_text: str,
     job_text: str,
@@ -50,37 +86,36 @@ def suggest_cv_improvements(
 ) -> str:
     """
     Ask the Ollama LLM for short, concrete suggestions so the CV aligns
-    better with the Job.  The response is limited to ~250 Portuguese words.
+    better with the Job. Returns plain text with one suggestion per line,
+    without Markdown or special formatting.
     """
     sys_msg = (
         "Você é um consultor de carreira. "
-        "Analise o currículo e a vaga abaixo e indique, em até "
-        f"{_MAX_WORDS} palavras, COMO o estudante pode se aproximar da vaga. "
-        "Use listas objetivas, não elabore além do necessário."
+        "Liste de 3 a 5 lacunas principais no currículo em relação à vaga. "
+        "Responda em texto simples, sem Markdown, listas numeradas ou marcadores."
     )
 
     hum_msg = textwrap.dedent(f"""\
-        === CURRÍCULO ===
+        CURRÍCULO:
         {cv_text.strip()}
 
-        === VAGA ===
+        VAGA:
         {job_text.strip()}
 
-        === HABILIDADES/FRASES AUSENTES (top {top_k}) ===
+        HABILIDADES/FRASES AUSENTES (top {top_k}):
         {", ".join(missing_tokens[:top_k])}
 
         Instruções:
-        1. Liste de 3 a 5 lacunas principais.
-        2. Para cada lacuna, sugira ações claras (ex.: curso X, projeto Y).
-        3. Não ultrapasse {_MAX_WORDS} palavras no total.
-        4. Responda apenas em português brasileiro.
+        1. Para cada lacuna, descreva uma ação clara em uma linha.
+        2. Não ultrapasse {_MAX_WORDS} palavras.
+        3. Responda apenas em português brasileiro.
+        4. Sem Markdown ou formatação especial.
     """)
 
     response = OLLAMA_LLM_LARGER.invoke([
         ("system", sys_msg),
-        ("human",  hum_msg)
+        ("human", hum_msg)
     ])
-    # .invoke may return a Message / dict depending on wrapper; force str
     return str(response)
 
 def get_embed_func(base_url : str = OLLAMA_URL):

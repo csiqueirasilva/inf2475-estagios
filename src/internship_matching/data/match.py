@@ -1,3 +1,6 @@
+from pathlib import Path
+import textwrap
+from typing import Sequence
 import uuid
 import json
 import pickle
@@ -8,6 +11,9 @@ import hdbscan
 from functools import lru_cache
 from sklearn.preprocessing import normalize
 from sklearn.metrics.pairwise import cosine_similarity
+
+from ..data.embed import OLLAMA_LLM_LARGER, LatentTokenExplainer, NomicTokenExplainer, apply_cv_improvements, get_embed_func, suggest_cv_improvements
+from ..data.jobs import fetch_embeddings_job_with_metadata
 
 from ..data.db import POSTGRES_URL
 
@@ -188,4 +194,120 @@ def match_jobs_pipeline(
         "student_job_cluster":    student_job_cluster,
         "used_simple_assignment": used_simple,
         "matched_jobs":           matched,
+    }
+
+def compute_gauge(score: float) -> tuple[int, str]:
+    """
+    Convert a 0–1 score into a 0–100 percentage and a gauge color.
+    0–33 → red, 34–66 → yellow, 67–100 → green.
+    """
+    pct = int(round(score * 100))
+    if pct <= 33:
+        color = "red"
+    elif pct <= 66:
+        color = "yellow"
+    else:
+        color = "green"
+    return pct, color
+
+def apply_piecewise_power(score: float) -> float:
+    """
+    Apply a discontinuous power-law:
+      - score <= 0.6: exponent 4
+      - 0.6 < score <= 0.9: exponent 2
+      - score > 0.9: exponent 1
+    """
+    if score <= 0.65:
+        exp = 5.0
+    elif score <= 0.88:
+        exp = 3.0
+    else:
+        exp = 1.0
+    return float(score ** exp)
+
+def get_distance_suggestions_pipeline(
+    contract_id: int,
+    *,
+    cv_text: str | None = None,
+    cv_file: Path | None = None,
+    embedding_type: str = "NOMIC",
+    top_k: int = 10,
+) -> dict:
+    """
+    Pipeline to compute initial similarity, generate LLM-based CV improvement suggestions,
+    integrate them into the CV, recompute similarity, apply piecewise power-law scaling,
+    and compute gauge percentages and colors.
+    """
+    # 1) Load or read CV text
+    if cv_text is None:
+        if cv_file is None or not cv_file.exists():
+            raise ValueError("Provide --cv-text or --cv-file.")
+        cv_text = cv_file.read_text(encoding="utf-8")
+
+    # 2) Load job embedding & text
+    jobs = fetch_embeddings_job_with_metadata()
+    try:
+        job_row = jobs.set_index("contract_id").loc[contract_id]
+    except KeyError:
+        raise ValueError(f"Job contract_id {contract_id} not found.")
+    job_vec  = np.asarray(job_row["embedding"], dtype=np.float32)
+    job_text = job_row["raw_input"]
+
+    # 3) Embed CV
+    embed_fn = get_embed_func()
+    cv_vec = np.asarray(embed_fn(cv_text)[0], dtype=np.float32)
+
+    # 4) Raw & normalized similarity
+    raw_sim = float(cosine_similarity(
+        cv_vec.reshape(1, -1),
+        job_vec.reshape(1, -1)
+    )[0, 0])
+    norm_sim = (1.0 + raw_sim) / 2.0
+
+    # 5) Token-based gap analysis
+    Expl  = NomicTokenExplainer if embedding_type.upper()=="NOMIC" else LatentTokenExplainer
+    cv_ex  = Expl();  cv_ex.build_vocab_from_texts([cv_text])
+    job_ex = Expl(); job_ex.build_vocab_from_texts([job_text])
+    cv_tokens  = cv_ex.nearest_tokens(cv_vec,  k=top_k)
+    job_tokens = job_ex.nearest_tokens(job_vec, k=top_k)
+    missing_tokens = [t for t in job_tokens if t not in cv_tokens]
+
+    # 6) Suggestions & 7) Apply them
+    suggestions      = suggest_cv_improvements(cv_text, job_text, missing_tokens, top_k=top_k)
+    improved_cv_text = apply_cv_improvements(cv_text, suggestions)
+
+    # 8) Recompute on improved CV
+    imp_vec  = np.asarray(embed_fn(improved_cv_text)[0], dtype=np.float32)
+    raw_imp  = float(cosine_similarity(
+        imp_vec.reshape(1, -1),
+        job_vec.reshape(1, -1)
+    )[0, 0])
+    norm_imp = (1.0 + raw_imp) / 2.0
+
+    # 9) Piecewise power-law scaling
+    scaled_initial  = apply_piecewise_power(norm_sim)
+    scaled_improved = apply_piecewise_power(norm_imp)
+
+    # 10) Gauges
+    pct_init, col_init = compute_gauge(scaled_initial)
+    pct_imp,  col_imp  = compute_gauge(scaled_improved)
+
+    return {
+        "contract_id":                  contract_id,
+        "initial_similarity":           raw_sim,
+        "initial_norm_similarity":      norm_sim,
+        "initial_scaled_similarity":    scaled_initial,
+        "initial_gauge_pct":            pct_init,
+        "initial_gauge_color":          col_init,
+        "suggestions":                  suggestions,
+        "cv_text":                      cv_text,
+        "job_text":                     job_text,
+        "improved_cv_text":             improved_cv_text,
+        "improved_similarity":          raw_imp,
+        "improved_norm_similarity":     norm_imp,
+        "improved_scaled_similarity":   scaled_improved,
+        "improved_gauge_pct":           pct_imp,
+        "improved_gauge_color":         col_imp,
+        "cv_top_tokens":                cv_tokens,
+        "job_top_tokens":               job_tokens,
     }

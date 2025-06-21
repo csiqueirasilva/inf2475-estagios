@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 import pickle
 import uuid
 import json
@@ -14,7 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from ..data.sharedautoencoder import CVJobSharedAutoencoder
 from .root import cli
-from ..data.match import match_jobs_pipeline
+from ..data.match import get_distance_suggestions_pipeline, match_jobs_pipeline
 from ..utils import deprecated
 from ..data.job_autoencoder import JobAutoencoder
 from ..constants import COLUMN_SHARED_LATENT_CODE, CV_CLUSTER_FILE_PATH, CV_NOMIC_CLUSTER_FILE_PATH, CVS_AUTOENCODER_FILE_PATH, DEFAULT_PIPELINE_TOP_K_LABELS, JOB_CLUSTER_FILE_PATH, JOB_NOMIC_CLUSTER_FILE_PATH, JOBS_AUTOENCODER_FILE_PATH, JOBS_EMBEDDING_COLUMN_NAME
@@ -387,3 +388,42 @@ def run_job_feat(input_file):
     outp = infer_job_feat(inp)
     click.echo(outp)
     #log_to_db(uid, "run", "job-feat", inp, outp)
+
+@run.command("distance-suggestions")
+@click.option("-c", "--contract-id", required=True, type=int,
+              help="Job contract ID to compare against.")
+@click.option("--cv-text", help="CV text directly as input.")
+@click.option("--cv-file", type=click.Path(exists=True),
+              help="Path to a .txt file with CV text.")
+@click.option("--embedding-type",
+              type=click.Choice(["NOMIC", "AUTOENCODE"], case_sensitive=False),
+              default="NOMIC", show_default=True,
+              help="Embedding space to use.")
+@click.option("--top-k", default=10, show_default=True,
+              help="Number of tokens for gap analysis.")
+def distance_suggestions_cmd(contract_id, cv_text, cv_file, embedding_type, top_k):
+    result = get_distance_suggestions_pipeline(
+        contract_id,
+        cv_text=cv_text,
+        cv_file=Path(cv_file) if cv_file else None,
+        embedding_type=embedding_type,
+        top_k=top_k
+    )
+
+    click.echo(f"Original CV:\n{result['cv_text']}\n")
+    click.echo(f"Job text:\n{result['job_text']}\n")
+    click.echo(f"Initial raw similarity    : {result['initial_similarity']:.4f}")
+    click.echo(f"Initial norm similarity   : {result['initial_norm_similarity']:.4f}")
+    click.echo(f"Initial scaled similarity : {result['initial_scaled_similarity']:.4f}")
+    click.echo(f"Initial gauge             : {result['initial_gauge_pct']}% ({result['initial_gauge_color']})\n")
+
+    click.echo(f"Top CV tokens: {', '.join(result['cv_top_tokens'])}")
+    click.echo(f"Top Job tokens: {', '.join(result['job_top_tokens'])}\n")
+
+    click.echo(f"LLM Suggestions:\n{result['suggestions']}\n")
+
+    click.echo(f"Improved CV:\n{result['improved_cv_text']}\n")
+    click.echo(f"Improved raw similarity    : {result['improved_similarity']:.4f}")
+    click.echo(f"Improved norm similarity   : {result['improved_norm_similarity']:.4f}")
+    click.echo(f"Improved scaled similarity : {result['improved_scaled_similarity']:.4f}")
+    click.echo(f"Improved gauge             : {result['improved_gauge_pct']}% ({result['improved_gauge_color']})")

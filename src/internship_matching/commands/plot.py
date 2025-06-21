@@ -7,6 +7,8 @@ from typing import Counter, Dict
 import json
 import click
 from matplotlib import pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Rectangle
 import numpy as np
 import pandas as pd
 from sklearn.manifold import TSNE
@@ -14,6 +16,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.spatial import ConvexHull, QhullError
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.cluster.hierarchy import linkage, leaves_list
+
+from ..data.match import apply_piecewise_power, get_distance_suggestions_pipeline
 from .root import cli
 from ..templates import PALETTE, THREEJS_TEMPLATE
 from ..data.plot import plot_embeddings_latent_space
@@ -858,3 +862,93 @@ def plot_comparative_cv_autoencoder(seed : str):
                 for reduction in reductions:
                     CVAutoencoder.plot_latent_space(model, embeds, reduction, labels=errors, latent_size=latent_size, embedding_column=col, seed=parsed_seed, loss_type=loss_type)
                     model.save_round_trip_report(embeds, f"data/processed/cv_autoencoder_roundtrip_{reduction}_{latent_size}_{col}_{parsed_seed}_{loss_type}.json")
+
+# ─── Shared gauge configuration ──────────────────────────────────────────
+GAUGE_THRESHOLDS = [0.33, 0.66]     # boundaries in [0,1]
+GAUGE_COLORS     = ["red", "yellow", "green"]
+
+# ─── helper from your plot module ─────────────────────────────────────────
+def draw_linear_gauge(ax, score: float, title: str = ""):
+    """
+    Draw a horizontal 0–1 gauge:
+      - gradient background from red→yellow→green
+      - black border
+      - a vertical arrow at `score`
+    """
+    # 1) gradient background
+    cmap = LinearSegmentedColormap.from_list("gauge", GAUGE_COLORS)
+    grad = np.linspace(0, 1, 512).reshape(1, -1)
+    ax.imshow(
+        grad,
+        aspect="auto",
+        cmap=cmap,
+        extent=(0, 1, 0, 1),
+        origin="lower"
+    )
+
+    # 2) border
+    ax.add_patch(Rectangle((0, 0), 1, 1,
+                           fill=False,
+                           edgecolor="black",
+                           lw=2))
+
+    # 3) arrow marker
+    # annotate from just below the bar up into the bar
+    ax.annotate(
+        "", 
+        xy=(score, 0.7),      # arrow tip
+        xytext=(score, -0.1), # arrow tail
+        arrowprops=dict(
+            arrowstyle="-|>",  # simple arrow
+            lw=2,
+            color="black"
+        ),
+        annotation_clip=False
+    )
+
+    # 4) clean up axes
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(0, 1);    ax.set_ylim(0, 1)
+    ax.set_title(f"{title}\n{int(round(score*100))}%", pad=8)
+
+@plot.command("cv-job-gauge")
+@click.option("-c", "--contract-id", required=True, type=int,
+              help="Job contract ID to compare against.")
+@click.option("--cv-text", help="CV text directly as input.")
+@click.option("--cv-file", type=click.Path(exists=True),
+              help="Path to a .txt file with CV text.")
+@click.option("--top-k", default=10, show_default=True,
+              help="Number of tokens for gap analysis.")
+def distance_line_gauge(contract_id, cv_text, cv_file, top_k):
+    """
+    Plot before/after match as simple horizontal line gauges.
+    """
+    # 1) run your pipeline
+    result = get_distance_suggestions_pipeline(
+        contract_id,
+        cv_text=cv_text,
+        cv_file=Path(cv_file) if cv_file else None,
+        embedding_type="NOMIC",
+        top_k=top_k,
+    )
+
+    # 2) extract the piecewise‐powered scores
+    init_raw   = result["initial_norm_similarity"]
+    init_scaled= apply_piecewise_power(init_raw)
+    imp_raw    = result["improved_norm_similarity"]
+    imp_scaled = apply_piecewise_power(imp_raw)
+
+    # 3) draw two gauges side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 2.5))
+    draw_linear_gauge(ax1, init_scaled, title="Initial Match")
+    draw_linear_gauge(ax2, imp_scaled,  title="Improved Match")
+    fig.tight_layout()
+
+    # 4) save to disk
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path("data/processed") / f"line_gauge_{contract_id}_{ts}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=300)
+    plt.close(fig)
+
+    click.echo(f"✅ Line‐gauge saved to {out}")
