@@ -500,16 +500,17 @@ def distance_suggestions_batch_cmd(limit, embedding_type, top_k, output_csv):
     click.echo(f"Worst deterioration (pts)    : {worst_diff:.1f}\n")
 
     # List worsened cases for inspection (contract_id, initial and improved gauge)
-    worsened = df_results[gauge_diffs < -5]
-    if not worsened.empty:
-        click.echo("Cases worsened beyond -5 pts:")
-        for _, row in worsened.iterrows():
-            click.echo(
-                f" - contract {row['contract_id']}: "
-                f"initial {row['initial_gauge_pct']}% → "
-                f"improved {row['improved_gauge_pct']}%"
-            )
-        click.echo()
+    if len(df_results) <= 5000:
+        worsened = df_results[gauge_diffs < -5]
+        if not worsened.empty:
+            click.echo("Cases worsened beyond -5 pts:")
+            for _, row in worsened.iterrows():
+                click.echo(
+                    f" - contract {row['contract_id']}: "
+                    f"initial {row['initial_gauge_pct']}% → "
+                    f"improved {row['improved_gauge_pct']}%"
+                )
+            click.echo()
 
     # Build & emit LaTeX summary table
     summary_df = pd.DataFrame({
